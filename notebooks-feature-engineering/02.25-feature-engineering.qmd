@@ -1,0 +1,187 @@
+---
+title: "02.25 - Feature Engineering (A‐only)"
+format: html
+jupyter: python3
+---
+
+## 1. Load & Tag A/B
+
+```{python}
+import duckdb
+import pandas as pd
+from pathlib import Path
+
+project_root    = Path().resolve().parent
+db_path         = project_root / "weather.duckdb"
+
+in_sample_start = "2010-01-01"
+in_sample_end   = "2018-12-31"
+
+# Pull with a sample flag
+con = duckdb.connect(str(db_path))
+df = con.execute(f"""
+  SELECT
+    *,
+    CASE
+      WHEN date BETWEEN '{in_sample_start}' AND '{in_sample_end}' THEN 'A'
+      ELSE 'B'
+    END AS sample
+  FROM weather
+""").fetchdf()
+con.close()
+
+# Fix types and compute day_of_year
+df["date"]        = pd.to_datetime(df["date"])
+df["day_of_year"] = df["date"].dt.dayofyear
+
+# Working copy
+df_feat = df.copy()
+
+```
+
+## 2. Clean (A‐only) & Drop Missing
+```{python}
+
+import numpy as np
+
+# Extract A‐sample for feature computation
+df_A = df_feat[df_feat["sample"] == "A"].copy()
+
+# Replace sentinel and drop missing
+df_A.replace(-999, np.nan, inplace=True)
+df_A.dropna(inplace=True)
+
+print("A after clean:", df_A.shape)
+
+```
+
+## 3. Seasonal Averages (computed on A only)
+```{python}
+
+def seasonal_avg_dfs(df, exclude=None):
+    if exclude is None:
+        exclude = {"date","day_of_year","location","lat","lon","sample"}
+    dfs = []
+    feats = [c for c in df.columns if c not in exclude]
+    for col in feats:
+        clim = (
+            df
+            .groupby(["location","day_of_year"])[col]
+            .mean()
+            .reset_index(name=f"{col}_seasonal_avg")
+        )
+        dfs.append(clim)
+    return dfs
+
+exclude = {"date","day_of_year","location","lat","lon","sample"}
+seasonal_tables = seasonal_avg_dfs(df_A, exclude)
+
+# Merge back onto full df_feat
+for tbl in seasonal_tables:
+    df_feat = df_feat.merge(tbl, on=["location","day_of_year"], how="left")
+
+print("Seasonal cols:", [c for c in df_feat.columns if c.endswith("_seasonal_avg")])
+
+```
+
+## 4. Rolling Means (computed on A only)
+```{python}
+
+# Define columns and windows
+roll_cols    = ["t2m","t2m_max","t2m_min","prectotcorr"]
+roll_windows = [7, 30]
+
+# Sort A‐sample so transform’s rolling sees the correct order
+df_A = df_A.sort_values(["location","date"]).reset_index(drop=True)
+
+for col in roll_cols:
+    for w in roll_windows:
+        roll_name = f"{col}_{w}d_avg"
+        # Compute rolling mean via transform (aligned to df_A index)
+        df_A[roll_name] = (
+            df_A
+            .groupby("location")[col]
+            .transform(lambda x: x.rolling(window=w, min_periods=1).mean())
+        )
+        # Merge that column back onto df_feat by location+date
+        df_feat = df_feat.merge(
+            df_A[["location","date",roll_name]],
+            on=["location","date"],
+            how="left"
+        )
+
+print("Rolling cols:", [c for c in df_feat.columns if c.endswith(("7d_avg","30d_avg"))])
+
+```
+
+
+## 5. Global Clean (drop any leftover -999 rows)
+```{python}
+
+# Replace sentinel -999 with NaN everywhere
+df_feat.replace(-999, np.nan, inplace=True)
+
+# Now drop any rows that still have NaNs (this will remove test rows
+# where original data was missing)
+df_feat.dropna(inplace=True)
+
+print("After global clean, total rows:", df_feat.shape)
+print("Sample counts:\n", df_feat["sample"].value_counts())
+
+```
+
+## 6. Split into Train/Test
+```{python}
+
+df_train = df_feat[df_feat["sample"] == "A"].copy()
+df_test  = df_feat[df_feat["sample"] == "B"].copy()
+
+print("Train:", df_train.shape, "Test:", df_test.shape)
+
+```
+
+## 7. Example Plot (A only)
+```{python}
+import plotly.express as px
+
+loc    = "Chattanooga"
+subset = df_train[df_train["location"] == loc]
+
+fig = px.line(
+    subset,
+    x="date",
+    y=["t2m_max","t2m_max_seasonal_avg","t2m_max_7d_avg","t2m_max_30d_avg"],
+    labels={"value":"T₂ₘₐₓ","variable":"Feature"},
+    title=f"{loc} – Observed vs Seasonal & Rolling (A)"
+)
+fig.show()
+
+```
+
+```{python}
+df_train.head()
+df_test.head()
+```
+
+```{python}
+
+from pathlib import Path
+
+# 7a) Make sure there’s a data/ directory
+project_root = Path().resolve().parent
+data_dir     = project_root / "data"
+data_dir.mkdir(exist_ok=True)
+
+# 7b) Write out Parquet (no index column)
+train_path = data_dir / "weather_train.parquet"
+test_path  = data_dir / "weather_test.parquet"
+
+df_train.to_parquet(train_path, index=False)
+df_test .to_parquet(test_path,  index=False)
+
+print("Wrote:")
+print(" •", train_path)
+print(" •", test_path)
+
+```
+

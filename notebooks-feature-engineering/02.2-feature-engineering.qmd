@@ -1,0 +1,133 @@
+---
+title: "02 - Add Seasonal Averages & Sample Split"
+format: html
+jupyter: python3
+---
+
+## 1. Load raw data **with** A/B sample flags
+
+```{python}
+import duckdb
+import pandas as pd
+from pathlib import Path
+import numpy as np
+
+project_root     = Path().resolve().parent
+db_path          = project_root / "weather.duckdb"
+
+# Define your in-sample window
+in_sample_start  = "2010-01-01"
+in_sample_end    = "2018-12-31"
+
+con = duckdb.connect(str(db_path))
+df_orig = con.execute(f"""
+  SELECT
+    *,
+    CASE
+      WHEN date BETWEEN '{in_sample_start}' AND '{in_sample_end}' THEN 'A'
+      ELSE 'B'
+    END AS sample
+  FROM weather
+""").fetchdf()
+con.close()
+
+# Ensure proper types & day-of-year
+df_orig["date"]        = pd.to_datetime(df_orig["date"])
+df_orig["day_of_year"] = df_orig["date"].dt.dayofyear
+
+# Make a working copy
+df_feat = df_orig.copy()
+```
+
+## 2. Clean the data
+```{python}
+
+# Replace sentinel -999 with NaN, then drop any rows with missing data
+df_feat.replace(-999, np.nan, inplace=True)
+df_feat.dropna(inplace=True)
+
+# Quick check that 'sample' is present
+print(df_feat["sample"].value_counts())
+
+```
+
+## 3. Helper: compute seasonal averages for any feature
+```{python}
+
+def seasonal_avg_dfs(df, exclude_cols=None):
+    """
+    Returns a list of small DataFrames, one per feature,
+    each containing (location, day_of_year, <feature>_seasonal_avg).
+    """
+    if exclude_cols is None:
+        exclude_cols = {"date","day_of_year","location","lat","lon","sample"}
+
+    dfs = []
+    # All columns except those in exclude_cols
+    features = [c for c in df.columns if c not in exclude_cols]
+
+    for feature_col in features:
+        clim = (
+            df
+            .groupby(["location","day_of_year"])[feature_col]
+            .mean()
+            .reset_index(name=f"{feature_col}_seasonal_avg")
+        )
+        dfs.append(clim)
+    return dfs
+
+```
+
+## 4. Compute & merge seasonal averages using only A‐sample data
+```{python}
+
+# 4a) Isolate in-sample (A) rows
+df_A = df_feat[df_feat["sample"] == "A"]
+
+# 4b) Compute seasonal-avg tables on df_A only
+exclude = {"date","day_of_year","location","lat","lon","sample"}
+clim_dfs_A = seasonal_avg_dfs(df_A, exclude_cols=exclude)
+
+# 4c) Merge each seasonal-avg back onto the full df_feat
+for clim in clim_dfs_A:
+    df_feat = df_feat.merge(
+        clim,
+        on=["location","day_of_year"],
+        how="left"
+    )
+
+# 4d) Confirm seasonal columns
+seasonal_cols = [c for c in df_feat.columns if c.endswith("_seasonal_avg")]
+print("Seasonal average columns:", seasonal_cols)
+
+```
+
+## 5. Split into train/test sets
+```{python}
+
+df_train = df_feat[df_feat["sample"] == "A"].copy()
+df_test  = df_feat[df_feat["sample"] == "B"].copy()
+
+print("Train shape:", df_train.shape)
+print("Test  shape:", df_test.shape)
+
+```
+
+## 6. Example plot of a seasonal feature in-sample
+```{python}
+
+import plotly.express as px
+
+location = "Chattanooga"
+df_plot  = df_train[df_train["location"] == location]
+
+fig = px.line(
+    df_plot,
+    x="date",
+    y=["t2m_max", "t2m_max_seasonal_avg"],
+    labels={"value":"T2M Max (°C)", "variable":"Legend"},
+    title=f"T2M Max vs Seasonal Avg for {location}"
+)
+fig.show()
+
+```

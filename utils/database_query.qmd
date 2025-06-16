@@ -1,0 +1,50 @@
+---
+title: "SQL query"
+format: html
+jupyter: python3
+----------------
+
+## 0. Parameters
+
+```{python}
+from pathlib import Path
+
+# ─── Editable parameters ─────────────────────────────────────────────
+city        = "Chattanooga"      # which city to model
+train_start = "2015-01-01"       # inclusive
+train_end   = "2022-12-31"       # inclusive
+test_start  = "2023-01-01"       # inclusive
+test_end    = "2023-12-31"       # inclusive
+forecast_horizon = None          # not used; we forecast exactly test range
+
+# ─── Internal paths ─────────────────────────────────────────────────
+project_root = Path().resolve().parent
+db_path      = project_root / "weather.duckdb"
+
+assert db_path.exists(), f"DuckDB not found at {db_path}"
+print(f"DB path:       {db_path}")
+print(f"City:          {city}")
+print(f"Train window:  {train_start} → {train_end}")
+print(f"Test window:   {test_start} → {test_end}")
+```
+
+
+## 1. Load & Clean Data
+
+```{python}
+import duckdb
+import pandas as pd
+
+# 1a) Query raw columns from DuckDB
+# MODIFIED: Removed 'sample' from the query
+query = f"""
+SELECT *
+FROM weather
+LIMIT 100; -- Or LIMIT 100 to get a good sense
+"""
+df = duckdb.connect(str(db_path)).execute(query).fetchdf()
+
+
+df.head(100)
+```
+

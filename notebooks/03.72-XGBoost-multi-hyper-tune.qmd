@@ -1,0 +1,512 @@
+---
+title: "03.30 – XGBoost Baseline by City (Multi-Day Forecasts with Finalized Features)"
+format: html
+jupyter: python3
+----------------
+
+## 0. Parameters
+
+```{python}
+from pathlib import Path
+
+# ─── Editable parameters ─────────────────────────────────────────────
+city        = "Chattanooga"      # which city to model
+train_start = "2015-01-01"       # inclusive
+train_end   = "2022-12-31"       # inclusive
+test_start  = "2023-01-01"       # inclusive
+test_end    = "2023-12-31"       # inclusive
+forecast_horizon = None          # not used; we forecast exactly test range
+
+# ─── Internal paths ─────────────────────────────────────────────────
+project_root = Path().resolve().parent
+db_path      = project_root / "weather.duckdb"
+
+assert db_path.exists(), f"DuckDB not found at {db_path}"
+print(f"DB path:       {db_path}")
+print(f"City:          {city}")
+print(f"Train window:  {train_start} → {train_end}")
+print(f"Test window:   {test_start} → {test_end}")
+```
+
+
+## 1. Load & Clean Data
+
+```{python}
+import duckdb
+import pandas as pd
+
+# 1a) Query raw columns from DuckDB
+# MODIFIED: Removed 'sample' from the query
+query = f"""
+SELECT
+  date,
+  t2m,
+  t2m_max,
+  t2m_min,
+  t2m_range,
+  dewpoint,
+  rh2m,
+  ws10m,
+  wd10m,
+  ps,
+  allsky_sw_dwn,
+  allsky_lw_dwn,
+  prectotcorr -- Corrected column name
+FROM weather
+WHERE location = '{city}'
+  AND date BETWEEN '{train_start}' AND '{test_end}'
+ORDER BY date
+"""
+df = duckdb.connect(str(db_path)).execute(query).fetchdf()
+
+# 1b) Convert and drop sentinel
+# MODIFIED: Removed 'sample' from the numeric_cols list
+numeric_cols = [
+    "t2m","t2m_max","t2m_min","t2m_range","dewpoint","rh2m","ws10m",
+    "wd10m","ps","allsky_sw_dwn","allsky_lw_dwn","prectotcorr"
+]
+df["date"] = pd.to_datetime(df["date"])
+df = df[(df[numeric_cols]!= -999).all(axis=1)]
+
+print(f"After cleaning: {df.shape[0]} rows")
+df.head()
+```
+
+## 2. Feature Engineering
+
+```{python}
+import numpy as np
+
+# 2a) Date to numeric
+df["date_ordinal"] = df["date"].map(pd.Timestamp.toordinal)
+
+# 2b) Day-of-year and seasonal transform
+df["day_of_year"] = df["date"].dt.dayofyear
+# encode annual seasonality
+df["doy_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 365)
+df["doy_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365)
+
+# --- Target and Features for multiple forecast horizons ---
+# Create target columns for 1, 3, and 5 days later
+df["t2m_max_1_day_later"] = df["t2m_max"].shift(-1)
+df["t2m_max_3_days_later"] = df["t2m_max"].shift(-3)
+df["t2m_max_5_days_later"] = df["t2m_max"].shift(-5)
+
+# MODIFIED: Removed 'sample' from feature_cols
+feature_cols = [
+    "date_ordinal",
+    "day_of_year",
+    "doy_sin",
+    "doy_cos",
+    "t2m",          # Today's mean temp
+    "t2m_min",      # Today's min temp
+    "t2m_max",      # Today's max temp
+    "t2m_range",
+    "dewpoint",
+    "rh2m",
+    "ws10m",
+    "wd10m",
+    "ps",
+    "allsky_sw_dwn",
+    "allsky_lw_dwn",
+    "prectotcorr"  # Corrected column name
+]
+
+target_cols = [
+    "t2m_max_1_day_later",
+    "t2m_max_3_days_later",
+    "t2m_max_5_days_later"
+]
+
+# --- Handle NaNs from shifting the targets ---
+# Drop rows with NaN in any of the new target columns.
+original_rows = df.shape[0]
+df.dropna(subset=target_cols, inplace=True)
+print(f"Dropped {original_rows - df.shape[0]} rows due to NaNs from shifting targets.")
+
+print("Features:", feature_cols)
+print("Targets: ", target_cols)
+df.tail()
+```
+
+## 3. Train/Test Split
+
+```{python}
+# 3a) Boolean masks
+mask_train = (df["date"] >= train_start) & (df["date"] <= train_end)
+mask_test  = (df["date"] >= test_start)  & (df["date"] <= test_end)
+
+train_df = df[mask_train].reset_index(drop=True)
+test_df  = df[mask_test].reset_index(drop=True)
+
+print("Train rows:", train_df.shape[0])
+print("Test rows: ", test_df.shape[0])
+```
+
+## 4. Train XGBoost Model
+
+```{python}
+from xgboost import XGBRegressor
+
+models = {}
+for target_col in target_cols:
+    print(f"\nTraining model for: {target_col}")
+    # 4a) Prepare arrays
+    iX_train = train_df[feature_cols]
+    iy_train = train_df[target_col]
+
+    # 4b) Instantiate & fit
+    model = XGBRegressor(
+        n_estimators=100,
+        learning_rate=0.1,
+        random_state=0
+    )
+    model.fit(iX_train, iy_train)
+    models[target_col] = model
+    print(f"Model for {target_col} training complete.")
+
+print("\nAll models trained.")
+```
+
+## 5. Forecast & Evaluate
+
+```{python}
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import numpy as np
+
+df_eval = pd.DataFrame({"date": test_df["date"]})
+
+for target_col in target_cols:
+    X_test = test_df[feature_cols]
+    y_true = test_df[target_col]
+    y_pred = models[target_col].predict(X_test)
+
+    df_eval[f"y_true_{target_col}"] = y_true
+    df_eval[f"y_pred_{target_col}"] = y_pred
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    print(f"\nMetrics for {target_col}:")
+    print(f"  RMSE: {rmse:.3f}, MAE: {mae:.3f}")
+
+df_eval.head()
+```
+
+## 6. Plot Results
+
+```{python}
+import plotly.express as px
+import pandas as pd
+
+plot_df_list = []
+
+# Add Actual (Today's Max) for comparison - this is the unshifted, raw t2m_max
+plot_df_list.append(
+    df[["date", "t2m_max"]].assign(series="Actual (Today's Max)", type="Actual_Today")
+    .rename(columns={"t2m_max": "temperature"}) # Standardize column name
+)
+
+# Process only the specific test actual and prediction series we want to plot
+for target_col in target_cols:
+    horizon_name = target_col.replace('t2m_max_', '').replace('_later', '')
+    
+    if horizon_name == "1 day": # Keep Test Actual for 1 day out
+        plot_df_list.append(
+            df_eval[["date", f"y_true_{target_col}"]].assign(
+                series=f"Test Actual ({horizon_name})",
+                type=f"Test_Actual_{horizon_name}"
+            ).rename(columns={f"y_true_{target_col}": "temperature"}) # Standardize column name
+        )
+    
+    # Always include the Test Prediction for all horizons
+    plot_df_list.append(
+        df_eval[["date", f"y_pred_{target_col}"]].assign(
+            series=f"Test Pred ({horizon_name})",
+            type=f"Test_Pred_{horizon_name}"
+        ).rename(columns={f"y_pred_{target_col}": "temperature"}) # Standardize column name
+    )
+
+plot_df = pd.concat(plot_df_list, ignore_index=True)
+
+
+# Define a more robust color scale and line dash map
+# Base color for 1-day (darker), then progressively lighter for 3 and 5 days
+base_blue_1 = "#007BFF" # Darker blue for 1-day
+base_blue_3 = "#66B2FF" # Medium blue for 3-day
+base_blue_5 = "#ADD8FF" # Lighter blue for 5-day
+
+color_map = {
+    "Actual (Today's Max)": "black",
+
+    # 1-day forecast
+    "Test Actual (1 day)": base_blue_1,
+    "Test Pred (1 day)": "#3399FF", # Slightly lighter than base_blue_1
+
+    # 3-day forecast
+    "Test Pred (3 days)": "#99CCFF", # Slightly lighter than base_blue_3
+
+    # 5-day forecast
+    "Test Pred (5 days)": "#CCEEFF", # Slightly lighter than base_blue_5
+}
+
+line_dash_map = {
+    "Actual (Today's Max)": "solid",
+    "Test Actual (1 day)": "solid",
+    "Test Pred (1 day)": "dot", # Predictions as dots
+    "Test Pred (3 days)": "dot",
+    "Test Pred (5 days)": "dot",
+}
+
+fig = px.line(
+    plot_df,
+    x="date",
+    y="temperature", # Use the standardized 'temperature' column
+    color="series",
+    title=f"XGBoost Baseline for {city} - Multi-Day Forecasts",
+    template="plotly_white",
+    color_discrete_map=color_map,
+    line_dash_map=line_dash_map
+)
+fig.update_layout(height=600, xaxis_title="Date", yaxis_title="T2M max (°C)")
+fig.show()
+```
+
+# 6.1 Plot results with all data
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Choose the model for which you want to display feature importance
+# Let's start with the 1-day forecast model
+model_1day_forecast = models["t2m_max_1_day_later"]
+
+# Get feature importances
+# XGBoost stores them as a numpy array, corresponding to the order of feature_cols
+feature_importances = model_1day_forecast.feature_importances_
+
+# Create a DataFrame for better visualization and sorting
+importance_df = pd.DataFrame({
+    'Feature': feature_cols, # Use the global feature_cols list
+    'Importance': feature_importances
+})
+
+# Sort features by importance in descending order
+importance_df = importance_df.sort_values(by='Importance', ascending=False)
+
+print(f"Feature Importances for {target_cols[0]}:")
+print(importance_df.head(20)) # Print top 20 features
+
+# Plotting the top N feature importances
+plt.figure(figsize=(12, 8))
+sns.barplot(x='Importance', y='Feature', data=importance_df.head(20), palette='viridis')
+plt.title(f'Top 20 Feature Importances for {target_cols[0]} Model')
+plt.xlabel('Importance (F-score or Gain)')
+plt.ylabel('Feature')
+plt.grid(axis='x', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+
+# You can repeat this for other models (3-day and 5-day) if desired
+# model_3day_forecast = models["t2m_max_3_days_later"]
+# model_5day_forecast = models["t2m_max_5_days_later"]
+# ... and generate importance_df and plots for them
+```
+
+## 6.2 Plot differences between Test Actual and Test Pred
+
+```{python}
+import plotly.express as px
+import pandas as pd
+
+plot_error_df_list = []
+
+for target_col in target_cols:
+    horizon_name = target_col.replace('t2m_max_', '').replace('_later', '')
+    
+    # Calculate the error: Test Actual - Test Prediction
+    error_col = f"error_{horizon_name}"
+    df_eval[error_col] = df_eval[f"y_true_{target_col}"] - df_eval[f"y_pred_{target_col}"]
+    
+    plot_error_df_list.append(
+        df_eval[["date", error_col]].assign(
+            series=f"Error ({horizon_name})"
+        ).rename(columns={error_col: "error"}) # Standardize column name to 'error'
+    )
+
+plot_error_df = pd.concat(plot_error_df_list, ignore_index=True)
+
+# Define distinct colors for the error lines
+error_color_map = {
+    "Error (1 day)": "blue",
+    "Error (3 days)": "green",
+    "Error (5 days)": "red",
+}
+
+fig_error = px.line(
+    plot_error_df,
+    x="date",
+    y="error",
+    color="series",
+    title=f"Forecast Error for {city} by Horizon (Test Set)",
+    labels={"error": "Prediction Error (°C)", "date": "Date"}, # Customize labels
+    template="plotly_white",
+    color_discrete_map=error_color_map
+)
+
+# Add a horizontal line at y=0 to easily visualize positive vs. negative errors
+fig_error.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Zero Error")
+
+fig_error.update_layout(height=600)
+fig_error.show()
+```
+
+
+## 7 review model feature importance
+
+```{python}
+import plotly.express as px
+import pandas as pd
+
+plot_df_list = []
+
+# Add Actual (Today's Max) for comparison - this is the unshifted, raw t2m_max
+plot_df_list.append(
+    df[["date", "t2m_max"]].assign(series="Actual (Today's Max)", type="Actual_Today")
+    .rename(columns={"t2m_max": "temperature"}) # Standardize column name
+)
+
+# Process training data
+for target_col in target_cols:
+    horizon_name = target_col.replace('t2m_max_', '').replace('_later', '')
+    plot_df_list.append(
+        train_df[["date", target_col]].assign(
+            series=f"Train ({horizon_name})",
+            type=f"Train_{horizon_name}"
+        ).rename(columns={target_col: "temperature"}) # Standardize column name
+    )
+
+# Process test data (Actuals and Predictions)
+for target_col in target_cols:
+    horizon_name = target_col.replace('t2m_max_', '').replace('_later', '')
+    
+    # Test Actual
+    plot_df_list.append(
+        df_eval[["date", f"y_true_{target_col}"]].assign(
+            series=f"Test Actual ({horizon_name})",
+            type=f"Test_Actual_{horizon_name}"
+        ).rename(columns={f"y_true_{target_col}": "temperature"}) # Standardize column name
+    )
+    
+    # Test Prediction
+    plot_df_list.append(
+        df_eval[["date", f"y_pred_{target_col}"]].assign(
+            series=f"Test Pred ({horizon_name})",
+            type=f"Test_Pred_{horizon_name}"
+        ).rename(columns={f"y_pred_{target_col}": "temperature"}) # Standardize column name
+    )
+
+plot_df = pd.concat(plot_df_list, ignore_index=True)
+
+
+# Define a more robust color scale and line dash map
+# Base color for 1-day (darker), then progressively lighter for 3 and 5 days
+base_blue_1 = "#007BFF" # Darker blue for 1-day
+base_blue_3 = "#66B2FF" # Medium blue for 3-day
+base_blue_5 = "#ADD8FF" # Lighter blue for 5-day
+
+color_map = {
+    "Actual (Today's Max)": "black",
+
+    # 1-day forecast
+    "Train (1 day)": base_blue_1,
+    "Test Actual (1 day)": base_blue_1,
+    "Test Pred (1 day)": base_blue_1,
+
+    # 3-day forecast
+    "Train (3 days)": base_blue_3,
+    "Test Actual (3 days)": base_blue_3,
+    "Test Pred (3 days)": base_blue_3,
+
+    # 5-day forecast
+    "Train (5 days)": base_blue_5,
+    "Test Actual (5 days)": base_blue_5,
+    "Test Pred (5 days)": base_blue_5,
+}
+
+# Adjust shades for different types if desired
+# For predictions, we can use a lighter shade of the base color
+color_map["Test Pred (1 day)"] = "#3399FF" # Slightly lighter than base_blue_1
+color_map["Test Pred (3 days)"] = "#99CCFF" # Slightly lighter than base_blue_3
+color_map["Test Pred (5 days)"] = "#CCEEFF" # Slightly lighter than base_blue_5
+
+
+line_dash_map = {
+    "Actual (Today's Max)": "solid",
+    "Train (1 day)": "dot",
+    "Test Actual (1 day)": "solid",
+    "Test Pred (1 day)": "dot", # Predictions as dots
+    "Train (3 days)": "dot",
+    "Test Actual (3 days)": "solid",
+    "Test Pred (3 days)": "dot",
+    "Train (5 days)": "dot",
+    "Test Actual (5 days)": "solid",
+    "Test Pred (5 days)": "dot",
+}
+
+fig = px.line(
+    plot_df,
+    x="date",
+    y="temperature", # Use the standardized 'temperature' column
+    color="series",
+    title=f"XGBoost Baseline for {city} - Multi-Day Forecasts",
+    template="plotly_white",
+    color_discrete_map=color_map,
+    line_dash_map=line_dash_map
+)
+fig.update_layout(xaxis_title="Date", yaxis_title="T2M max (°C)")
+fig.show()
+
+```
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Choose the model for which you want to display feature importance
+# Let's start with the 1-day forecast model
+model_1day_forecast = models["t2m_max_1_day_later"]
+
+# Get feature importances
+# XGBoost stores them as a numpy array, corresponding to the order of feature_cols
+feature_importances = model_1day_forecast.feature_importances_
+
+# Create a DataFrame for better visualization and sorting
+importance_df = pd.DataFrame({
+    'Feature': feature_cols, # Use the global feature_cols list
+    'Importance': feature_importances
+})
+
+# Sort features by importance in descending order
+importance_df = importance_df.sort_values(by='Importance', ascending=False)
+
+print(f"Feature Importances for {target_cols[0]}:")
+print(importance_df.head(20)) # Print top 20 features
+
+# Plotting the top N feature importances
+plt.figure(figsize=(12, 8))
+sns.barplot(x='Importance', y='Feature', data=importance_df.head(20), palette='viridis')
+plt.title(f'Top 20 Feature Importances for {target_cols[0]} Model')
+plt.xlabel('Importance (F-score or Gain)')
+plt.ylabel('Feature')
+plt.grid(axis='x', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+
+# You can repeat this for other models (3-day and 5-day) if desired
+# model_3day_forecast = models["t2m_max_3_days_later"]
+# model_5day_forecast = models["t2m_max_5_days_later"]
+# ... and generate importance_df and plots for them
+```

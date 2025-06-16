@@ -1,0 +1,136 @@
+---
+title: "02 - Add Seasonal Averages"
+format: html
+jupyter: python3
+---
+
+## 1. Load raw data and make a working copy
+
+```{python}
+import duckdb
+import pandas as pd
+from pathlib import Path
+import numpy as np
+
+# 1a) Connect & pull the full 'weather' table
+project_root = Path().resolve().parent
+db_path      = project_root / "weather.duckdb"
+con          = duckdb.connect(str(db_path))
+
+df_orig = con.execute("SELECT * FROM weather").fetchdf()
+con.close()
+
+# 1b) Ensure day_of_year exists
+df_orig["date"]        = pd.to_datetime(df_orig["date"])
+df_orig["day_of_year"] = df_orig["date"].dt.dayofyear
+
+# 1c) Make a working copy for feature‐engineering
+df_feat = df_orig.copy()
+```
+
+```{python}
+#Check for  NaN, the values are -999
+df_feat.tail(10)
+
+```
+
+```{python}
+
+# Replace -999 with np.nan
+df_feat.replace(-999, np.nan, inplace=True)
+
+# Drop rows with any NaN values
+df_feat.dropna(inplace=True)
+
+df_feat.tail()
+
+```
+
+```{python}
+
+def seasonal_avg_dfs(df, exclude_cols=None):
+    """
+    For each column in df not in exclude_cols, compute the (location, day_of_year)
+    mean and return a list of small DataFrames:
+      [ DataFrame(location, day_of_year, <col>_seasonal_avg), ... ]
+    """
+    if exclude_cols is None:
+        exclude_cols = {"date", "day_of_year", "location", "lat", "lon"}
+
+    dfs = []
+    # find all feature columns
+    features = [c for c in df.columns if c not in exclude_cols]
+
+    for feature_col in features:
+        clim = (
+            df
+            .groupby(["location", "day_of_year"])[feature_col]
+            .mean()
+            .reset_index(name=f"{feature_col}_seasonal_avg")
+        )
+        dfs.append(clim)
+    return dfs
+
+```
+
+
+```{python}
+
+# 3a) Get all the seasonal‐avg small tables
+exclude = {"date","day_of_year","location","lat","lon"}
+clim_dfs = seasonal_avg_dfs(df_feat, exclude_cols=exclude)
+
+# 3b) Merge each one back into the working DataFrame
+for clim in clim_dfs:
+    df_feat = df_feat.merge(
+        clim,
+        on=["location", "day_of_year"],
+        how="left"
+    )
+
+# 3c) Inspect the result
+print("Original cols:", df_orig.columns.tolist())
+print("Augmented cols:", df_feat.columns.tolist())
+print(df_feat.head())
+print(df_feat.tail())
+
+```
+
+
+
+```{python}
+
+import plotly.express as px
+
+# Example: plot for a single location (e.g., 'Chattanooga')
+location = "Chattanooga"
+df_plot = df_feat[df_feat["location"] == location]
+
+fig = px.line(
+    df_plot,
+    x="date",
+    y=["t2m_max", "t2m_max_seasonal_avg"],
+    labels={"value": "Temperature (°C)", "date": "Date", "variable": "Legend"},
+    title=f"t2m_max vs t2m_max_seasonal_avg for {location}",
+    height=600  
+)
+fig.show()
+
+```
+
+```{python}
+
+location = "Chattanooga"
+df_plot = df_feat[df_feat["location"] == location]
+
+fig = px.line(
+    df_plot,
+    x="date",
+    y=["ws10m", "ws10m_seasonal_avg"],
+    labels={"value": "Wind Speed, 10m", "date": "Date", "variable": "Legend"},
+    title=f"ws10m_max vs ws10m_max_seasonal_avg for {location}",
+    height=600  
+)
+fig.show()
+
+```

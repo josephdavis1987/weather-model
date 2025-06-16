@@ -1,0 +1,28 @@
+
+```{python}
+
+import duckdb
+from pathlib import Path
+
+project_root = Path().resolve().parent
+con = duckdb.connect(str(project_root / "weather.duckdb"))
+
+# Preview a few rows
+df_sample = con.execute("""
+  SELECT * 
+  FROM weather 
+  WHERE location = 'Chattanooga' 
+  ORDER BY date 
+  LIMIT 10
+""").df()
+df_sample.head()
+
+
+```
+
+
+```{python}
+
+con.execute('Describe weather').df()
+
+```

@@ -1,0 +1,33 @@
+name: DS-stack1.0
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - duckdb
+  - sqlalchemy
+  - pyarrow
+  - rich
+  - seaborn
+  - tqdm
+  - matplotlib
+  - fastparquet
+  - ipywidgets
+  - numpy
+  - scipy
+  - duckdb-engine
+  - pandas
+  - plotly
+  - prophet
+  - cmdstanpy
+  - scikit-learn
+  - statsmodels
+  - notebook
+  - ipykernel
+  - streamlit
+  - jupyterlab_widgets
+  - jupyterlab
+  - pre-commit
+  - isort
+  - black
+  - python-dotenv
+prefix: C:\Users\josep\miniconda3\envs\DS-stack1.0

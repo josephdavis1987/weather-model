@@ -1,0 +1,136 @@
+---
+title: "01 - Load NASA POWER Data"
+format: html
+jupyter: python3
+---
+
+## 0. Fix Python import path so “utils” is visible
+```{python}
+from pathlib import Path
+import sys
+
+# Quarto’s working dir is notebooks/, so go up one level to the project root
+project_root = Path().resolve().parent
+sys.path.insert(0, str(project_root))
+print("✅ Added to sys.path:", project_root)
+
+```
+
+## 1. Imports
+```{python}
+import os
+import pandas as pd
+import duckdb
+from datetime import datetime
+from utils.nasa_power_api import fetch_nasa_power_data
+```
+
+## 2. Paths & CSV check
+```{python}
+
+project_root = Path().resolve().parent   # should point to weather-model/
+locations_csv = project_root / "data" / "locations.csv"
+
+print("Project root is:", project_root)
+print("Looking for locations.csv at:", locations_csv)
+print("Exists? →", locations_csv.exists())   # Should print True
+
+
+```
+
+
+```{python}
+
+
+# ─── 0. FIX PYTHON IMPORT PATH ───────────────────────────────────────────────
+#
+# Quarto sets the working directory to the folder containing this .qmd (notebooks/).
+# We want Python to also see the parent folder (weather-model/) so "from utils..." works.
+project_root = Path().resolve().parent   # => weather-model/
+sys.path.append(str(project_root))
+
+
+# ─── 2. PATHS & CHECK CSV ────────────────────────────────────────────────────
+locations_csv = project_root / "data" / "locations.csv"
+if not locations_csv.exists():
+    raise FileNotFoundError(f"{locations_csv} not found. Please ensure data/locations.csv exists.")
+
+# ─── 3. LOAD LOCATIONS & CONNECT DUCKDB ────────────────────────────────────
+locations = pd.read_csv(locations_csv)
+
+db_path = project_root / "weather.duckdb"
+con = duckdb.connect(str(db_path))
+
+# ─── 4. CREATE (OR REPLACE) TABLE SCHEMA ─────────────────────────────────────
+# We now include all fetched columns in the exact order returned by fetch_nasa_power_data:
+con.execute("""
+CREATE OR REPLACE TABLE weather (
+    date             DATE,
+    location         TEXT,
+    lat              DOUBLE,
+    lon              DOUBLE,
+    t2m              DOUBLE,   -- daily mean temperature
+    t2m_max          DOUBLE,   -- daily max temperature
+    t2m_min          DOUBLE,   -- daily min temperature
+    t2m_range        DOUBLE,   -- t2m_max - t2m_min
+    dewpoint         DOUBLE,   -- T2MDEW
+    rh2m             DOUBLE,   -- relative humidity
+    ws10m            DOUBLE,   -- wind speed at 10 m
+    wd10m            DOUBLE,   -- wind direction at 10 m
+    ps               DOUBLE,   -- surface pressure
+    allsky_sw_dwn    DOUBLE,   -- all-sky shortwave down
+    allsky_lw_dwn    DOUBLE,   -- all-sky longwave down
+    prectotcorr      DOUBLE,   -- corrected precipitation
+    day_of_year      INTEGER   -- 1–365/366
+)
+""")
+
+# (Optional) Location metadata table, unchanged
+con.execute("""
+CREATE TABLE IF NOT EXISTS locations_meta (
+    location TEXT PRIMARY KEY,
+    lat      DOUBLE,
+    lon      DOUBLE
+)
+""")
+
+for _, row in locations.iterrows():
+    loc = row["location"]
+    lat = float(row["lat"])
+    lon = float(row["lon"])
+    # Insert into locations_meta if absent
+    exists = con.execute(
+        "SELECT COUNT(*) FROM locations_meta WHERE location = ?",
+        [loc]
+    ).fetchone()[0]
+    if exists == 0:
+        con.execute(
+            "INSERT INTO locations_meta VALUES (?, ?, ?)",
+            [loc, lat, lon]
+        )
+
+# ─── 5. FETCH & INGEST LOOP ───────────────────────────────────────────────────
+start_date = "20000101"
+end_date = datetime.today().strftime("%Y%m%d")
+
+for _, row in locations.iterrows():
+    loc = row["location"]
+    lat = float(row["lat"])
+    lon = float(row["lon"])
+    print(f"→ Fetching NASA POWER data for: {loc}")
+    
+    df = fetch_nasa_power_data(
+        lat=lat,
+        lon=lon,
+        location=loc,
+        start=start_date,
+        end=end_date
+    )
+    # Register and INSERT into DuckDB:
+    con.register("temp_df", df)
+    con.execute("INSERT INTO weather SELECT * FROM temp_df")
+    con.unregister("temp_df")
+
+print("✅ All locations ingested into weather.duckdb")
+con.close()
+```

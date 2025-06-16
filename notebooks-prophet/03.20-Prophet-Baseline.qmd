@@ -1,0 +1,172 @@
+---
+title: "03.00 – Prophet Baseline by City"
+format: html
+jupyter: python3
+---
+
+```{python}
+# | message: false
+# 0  Imports & config --------------------------------------------------------
+from pathlib import Path
+import duckdb, pandas as pd, numpy as np
+from prophet import Prophet
+import plotly.graph_objects as go
+import plotly.io as pio
+
+#import cmdstanpy
+#cmdstanpy.install_cmdstan()
+#cmdstanpy.install_cmdstan(compiler=True)  # only valid on Windows
+
+
+pio.renderers.default = "notebook"  # or "vscode", "browser", etc.
+```
+
+
+```{python}
+
+# 1  Parameters --------------------------------------------------------------
+# Change this to try another location present in your weather table
+city  = "Chattanooga"
+
+# Database path (assumes the .qmd lives inside the project repo)
+project_root = Path().resolve().parent
+db_path      = project_root / "weather.duckdb"
+
+assert db_path.exists(), f"{db_path} not found"
+print(f"Using database → {db_path}\nCity            → {city}")
+
+```
+
+
+```{python}
+
+# 2  Pull just date & t2m_max for the chosen city ----------------
+query = """
+SELECT
+    date :: DATE             AS date,      -- enforce DATE type
+    t2m_max                  AS t2m_max
+FROM weather
+WHERE location = ?
+ORDER BY date
+"""
+
+con = duckdb.connect(str(db_path))
+df_raw = con.execute(query, [city]).fetchdf()
+con.close()
+
+print(f"{len(df_raw):,} rows pulled.")
+df_raw.head()
+
+```
+
+
+```{python}
+
+# 3  Prep for Prophet -------------------------------------------------------
+# Ensure proper dtypes & clean data
+df_raw["date"] = pd.to_datetime(df_raw["date"])
+df_raw = (df_raw.dropna(subset=["t2m_max"])
+                   .drop_duplicates(subset="date")
+                   .reset_index(drop=True))
+
+prophet_df = (df_raw
+              .rename(columns={"date": "ds", "t2m_max": "y"})
+              .sort_values("ds"))
+
+prophet_df.head()
+
+```
+
+
+```{python}
+
+# 4  Fit Prophet ------------------------------------------------------------
+m = Prophet(
+    yearly_seasonality=True,   # default = True; kept explicit for clarity
+    weekly_seasonality=False,
+    daily_seasonality=False,
+)
+
+m.fit(prophet_df)
+
+```
+
+
+```{python}
+
+# 5  Forecast two years ahead ----------------------------------------------
+future     = m.make_future_dataframe(periods=365*2, freq="D")
+forecast   = m.predict(future)
+
+print("Forecast span:", forecast["ds"].min().date(), "→",
+      forecast["ds"].max().date())
+forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail()
+
+```
+
+
+```{python}
+
+# 6  Plot ① – Prophet’s built-in static plot -------------------------------
+fig1 = m.plot(forecast, xlabel="Date", ylabel="t2m_max (°C)")
+fig1.suptitle(f"{city} – Prophet forecast (±80 % CI)", fontsize=14)
+
+```
+
+
+```{python}
+
+# 7  Plot ② – Plotly interactive overlay -----------------------------------
+hist_trace = go.Scatter(
+    x      = prophet_df["ds"],
+    y      = prophet_df["y"],
+    mode   = "markers",
+    name   = "Historical",
+    marker = dict(size=4, opacity=0.6)
+)
+
+fc_trace  = go.Scatter(
+    x      = forecast["ds"],
+    y      = forecast["yhat"],
+    mode   = "lines",
+    name   = "Forecast",
+    line   = dict(width=2)
+)
+
+band_trace = go.Scatter(
+    x        = np.concatenate([forecast["ds"], forecast["ds"][::-1]]),
+    y        = np.concatenate([forecast["yhat_upper"], forecast["yhat_lower"][::-1]]),
+    fill     = "toself",
+    fillcolor= "rgba(0,100,80,0.2)",
+    line     = dict(width=0),
+    name     = "80 % interval",
+    showlegend=True,
+)
+
+fig2 = go.Figure([band_trace, fc_trace, hist_trace])
+fig2.update_layout(
+    title       = f"{city}: t2m_max – history & 2-yr Prophet forecast",
+    xaxis_title = "Date",
+    yaxis_title = "t2m_max (°C)",
+    hovermode   = "x unified",
+    template    = "plotly_white"
+)
+fig2
+
+```
+
+
+```{python}
+
+import duckdb, pandas as pd, pyarrow as pa, plotly, prophet, sys
+print("--- versions ---")
+print("python  :", sys.version.split()[0])
+print("duckdb  :", duckdb.__version__)
+print("pandas  :", pd.__version__)
+print("pyarrow :", pa.__version__)
+print("prophet :", prophet.__version__)
+print("plotly  :", plotly.__version__)
+print("cmdstanpy  :", cmdstanpy.__version__)
+
+```
+

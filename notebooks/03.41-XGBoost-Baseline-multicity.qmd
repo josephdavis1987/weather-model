@@ -1,0 +1,425 @@
+---
+title: "03.10 – XGBoost Baseline by City (Multi-City, Multi-Day Forecasts with Lag Features - FIXES)"
+format: html
+jupyter: python3
+----------------
+
+## 0. Parameters
+
+```{python}
+from pathlib import Path
+
+# ─── Editable parameters ─────────────────────────────────────────────
+city        = "Chattanooga"      # This will now just be for the plot title if needed
+train_start = "2015-01-01"       # inclusive
+train_end   = "2022-12-31"       # inclusive
+test_start  = "2023-01-01"       # inclusive
+test_end    = "2023-12-31"       # inclusive
+forecast_horizon = None          # not used; we forecast exactly test range
+
+# ─── Internal paths ─────────────────────────────────────────────────
+project_root = Path().resolve().parent
+db_path      = project_root / "weather.duckdb"
+
+assert db_path.exists(), f"DuckDB not found at {db_path}"
+print(f"DB path:       {db_path}")
+print(f"Train window:  {train_start} → {train_end}")
+print(f"Test window:   {test_start} → {test_end}")
+```
+
+
+## 1. Load & Clean Data
+
+```{python}
+import duckdb
+import pandas as pd
+
+# 1a) Query raw columns from DuckDB
+query = f"""
+SELECT
+  date,
+  location, -- Include location as a column
+  lat,      -- Include lat
+  lon,      -- Include lon
+  t2m,
+  t2m_max,
+  t2m_min,
+  t2m_range,
+  dewpoint,
+  rh2m,
+  ws10m,
+  wd10m,
+  ps,
+  allsky_sw_dwn,
+  allsky_lw_dwn,
+  prectotcorr
+FROM weather
+WHERE date BETWEEN '{train_start}' AND '{test_end}'
+ORDER BY date, location -- Order by date AND location to keep groups together
+"""
+df = duckdb.connect(str(db_path)).execute(query).fetchdf()
+
+# 1b) Convert and drop sentinel
+numeric_cols = [
+    "t2m","t2m_max","t2m_min","t2m_range","dewpoint","rh2m","ws10m",
+    "wd10m","ps","allsky_sw_dwn","allsky_lw_dwn","prectotcorr",
+    "lat", "lon"
+]
+df["date"] = pd.to_datetime(df["date"])
+df = df[(df[numeric_cols]!= -999).all(axis=1)]
+
+print(f"After initial cleaning: {df.shape[0]} rows")
+print(f"Number of unique locations: {df['location'].nunique()}")
+df.head()
+
+```
+
+## 2. Feature Engineering
+
+```{python}
+import numpy as np
+
+# 2a) Date to numeric
+df["date_ordinal"] = df["date"].map(pd.Timestamp.toordinal)
+
+# 2b) Day-of-year and seasonal transform
+df["day_of_year"] = df["date"].dt.dayofyear
+df["doy_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 365)
+df["doy_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365)
+
+# --- NEW: Generate Lag Features (Before One-Hot Encoding) ---
+dynamic_weather_features = [
+    "t2m", "t2m_min", "t2m_max", "t2m_range", "dewpoint", "rh2m",
+    "ws10m", "wd10m", "ps", "allsky_sw_dwn", "allsky_lw_dwn", "prectotcorr"
+]
+lags = [1, 2, 3, 4, 5, 6, 7] # 1 to 7 days back
+
+for feature in dynamic_weather_features:
+    for lag in lags:
+        new_col_name = f"{feature}_lag_{lag}"
+        # Apply shift within each location group using the 'location' column itself
+        df[new_col_name] = df.groupby('location')[feature].shift(lag)
+
+# --- Target Creation (Before One-Hot Encoding) ---
+# Create target columns for 1, 3, and 5 days later
+# IMPORTANT: These shifts need to be done *within each location group*
+df['t2m_max_1_day_later'] = df.groupby('location')['t2m_max'].shift(-1)
+df['t2m_max_3_days_later'] = df.groupby('location')['t2m_max'].shift(-3)
+df['t2m_max_5_days_later'] = df.groupby('location')['t2m_max'].shift(-5)
+
+# --- One-Hot Encode 'location' (After all shift operations) ---
+# This creates new columns like 'location_Chattanooga', etc., and drops the original 'location' column
+df = pd.get_dummies(df, columns=['location'], prefix='location', dtype=int)
+
+
+# Build feature columns list
+feature_cols = [
+    "date_ordinal",
+    "day_of_year",
+    "doy_sin",
+    "doy_cos",
+    "lat",
+    "lon",
+    "t2m",
+    "t2m_min",
+    "t2m_max",
+    "t2m_range",
+    "dewpoint",
+    "rh2m",
+    "ws10m",
+    "wd10m",
+    "ps",
+    "allsky_sw_dwn",
+    "allsky_lw_dwn",
+    "prectotcorr"
+]
+
+# Add all generated lagged feature columns
+for feature in dynamic_weather_features:
+    for lag in lags:
+        feature_cols.append(f"{feature}_lag_{lag}")
+
+# Add all one-hot encoded 'location_' columns to feature_cols
+# This needs to be done dynamically after get_dummies has run
+location_ohe_cols = [col for col in df.columns if col.startswith('location_')]
+feature_cols.extend(location_ohe_cols)
+
+
+target_cols = [
+    "t2m_max_1_day_later",
+    "t2m_max_3_days_later",
+    "t2m_max_5_days_later"
+]
+
+# --- Handle NaNs from shifting targets AND lags ---
+# The maximum lag is 7 days, and max target shift is 5 days.
+# The `dropna` will remove rows where any of these are NaN.
+# This will result in more rows being dropped from the beginning of your dataset per city.
+original_rows = df.shape[0]
+# Collect all relevant columns for dropna: targets + all lagged features
+all_cols_to_check_for_nan = target_cols + [f"{feat}_lag_{lag}" for feat in dynamic_weather_features for lag in lags]
+df.dropna(subset=all_cols_to_check_for_nan, inplace=True)
+print(f"Dropped {original_rows - df.shape[0]} rows due to NaNs from shifting targets and lags.")
+
+print("Features:", feature_cols)
+print("Targets: ", target_cols)
+df.tail()
+```
+
+## 3. Train/Test Split
+
+```{python}
+# 3a) Boolean masks
+mask_train = (df["date"] >= train_start) & (df["date"] <= train_end)
+mask_test  = (df["date"] >= test_start)  & (df["date"] <= test_end)
+
+train_df = df[mask_train].reset_index(drop=True)
+test_df  = df[mask_test].reset_index(drop=True)
+
+print("Train rows:", train_df.shape[0])
+print("Test rows: ", test_df.shape[0])
+```
+
+## 4. Train XGBoost Model
+
+```{python}
+from xgboost import XGBRegressor
+
+models = {}
+for target_col in target_cols:
+    print(f"\nTraining model for: {target_col}")
+    # 4a) Prepare arrays
+    iX_train = train_df[feature_cols]
+    iy_train = train_df[target_col]
+
+    # 4b) Instantiate & fit
+    model = XGBRegressor(
+        n_estimators=500,
+        learning_rate=0.05,
+        random_state=0
+    )
+    model.fit(iX_train, iy_train)
+    models[target_col] = model
+    print(f"Model for {target_col} training complete.")
+
+print("\nAll models trained.")
+```
+
+## 5. Forecast & Evaluate
+
+```{python}
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import numpy as np
+
+# We'll create a df_eval that potentially includes 'location' for analysis if needed,
+# but for overall metrics, it's not strictly necessary.
+# Let's keep it consistent with previous:
+df_eval = pd.DataFrame({"date": test_df["date"]})
+# Store original location name from the test_df for plotting filter later
+# Note: 'location_Chattanooga' is just one of the OHE columns.
+# We need the original location string for filtering the plot.
+# Let's ensure the original 'location' column is available for plotting filter.
+# It seems get_dummies drops the original 'location' column.
+# We need to make sure we can filter for 'Chattanooga' after OHE.
+# The current approach for plotting filters on 'location_Chattanooga' == 1, which works.
+# So, df_eval doesn't strictly need it here.
+
+for target_col in target_cols:
+    X_test = test_df[feature_cols]
+    y_true = test_df[target_col]
+    y_pred = models[target_col].predict(X_test)
+
+    df_eval[f"y_true_{target_col}"] = y_true
+    df_eval[f"y_pred_{target_col}"] = y_pred
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    print(f"\nMetrics for {target_col}:")
+    print(f"  RMSE: {rmse:.3f}, MAE: {mae:.3f}")
+
+df_eval.head()
+```
+
+## 6. Plot Results
+
+```{python}
+import plotly.express as px
+import pandas as pd
+
+# Define base colors once
+base_blue_1 = "#007BFF" # Darker blue for 1-day
+base_blue_3 = "#66B2FF" # Medium blue for 3-day
+base_blue_5 = "#ADD8FF" # Lighter blue for 5-day
+
+# Re-filter df for Chattanooga (since df now contains all cities)
+# This uses the one-hot encoded column to find Chattanooga's data
+chattanooga_mask_full_df = df['location_Chattanooga'] == 1
+df_chattanooga_actual = df[chattanooga_mask_full_df].copy()
+
+# Re-filter test_df for Chattanooga (since test_df now contains all cities)
+chattanooga_mask_test_df = test_df['location_Chattanooga'] == 1
+test_df_chattanooga = test_df[chattanooga_mask_test_df].reset_index(drop=True)
+
+# Re-run prediction for the filtered test_df_chattanooga to get y_pred for plotting
+# This ensures plot_df_eval_chattanooga contains only Chattanooga's data
+temp_df_eval_chattanooga = pd.DataFrame({"date": test_df_chattanooga["date"]})
+
+for target_col in target_cols:
+    X_test_chattanooga = test_df_chattanooga[feature_cols]
+    y_true_chattanooga = test_df_chattanooga[target_col]
+    y_pred_chattanooga = models[target_col].predict(X_test_chattanooga)
+
+    temp_df_eval_chattanooga[f"y_true_{target_col}"] = y_true_chattanooga
+    temp_df_eval_chattanooga[f"y_pred_{target_col}"] = y_pred_chattanooga
+
+
+# --- First Plot (Original) ---
+plot_df_list_original = []
+
+# Add Actual (Today's Max) for comparison
+plot_df_list_original.append(
+    df_chattanooga_actual[["date", "t2m_max"]].assign(series="Actual (Today's Max)", type="Actual_Today")
+    .rename(columns={"t2m_max": "temperature"})
+)
+
+for target_col in target_cols:
+    horizon_name = target_col.replace('t2m_max_', '').replace('_later', '')
+
+    if horizon_name == "1 day":
+        plot_df_list_original.append(
+            temp_df_eval_chattanooga[["date", f"y_true_{target_col}"]].assign(
+                series=f"Test Actual ({horizon_name})",
+                type=f"Test_Actual_{horizon_name}"
+            ).rename(columns={f"y_true_{target_col}": "temperature"})
+        )
+
+    plot_df_list_original.append(
+        temp_df_eval_chattanooga[["date", f"y_pred_{target_col}"]].assign(
+            series=f"Test Pred ({horizon_name})",
+            type=f"Test_Pred_{horizon_name}"
+        ).rename(columns={f"y_pred_{target_col}": "temperature"})
+    )
+
+plot_df_original = pd.concat(plot_df_list_original, ignore_index=True)
+
+color_map_original = {
+    "Actual (Today's Max)": "black",
+    "Test Actual (1 day)": base_blue_1,
+    "Test Pred (1 day)": "#3399FF",
+    "Test Pred (3 days)": "#99CCFF",
+    "Test Pred (5 days)": "#CCEEFF",
+}
+
+line_dash_map_original = {
+    "Actual (Today's Max)": "solid",
+    "Test Actual (1 day)": "solid",
+    "Test Pred (1 day)": "dot",
+    "Test Pred (3 days)": "dot",
+    "Test Pred (5 days)": "dot",
+}
+
+fig_original = px.line(
+    plot_df_original,
+    x="date",
+    y="temperature",
+    color="series",
+    title=f"XGBoost Baseline for {city} (Trained on Multiple Cities)",
+    template="plotly_white",
+    color_discrete_map=color_map_original,
+    line_dash_map=line_dash_map_original
+)
+fig_original.update_layout(xaxis_title="Date", yaxis_title="T2M max (°C)")
+fig_original.show()
+
+# --- Second Plot (Shifted 1-Day Prediction) ---
+plot_df_shifted = []
+
+# Add Actual (Today's Max)
+plot_df_shifted.append(
+    df_chattanooga_actual[["date", "t2m_max"]].assign(series="Actual (Today's Max)")
+    .rename(columns={"t2m_max": "temperature"})
+)
+
+# Add Test Actual (1 day)
+plot_df_shifted.append(
+    temp_df_eval_chattanooga[["date", "y_true_t2m_max_1_day_later"]].assign(series="Test Actual (1 day)")
+    .rename(columns={"y_true_t2m_max_1_day_later": "temperature"})
+)
+
+# Add Shifted Test Pred (1 day)
+test_pred_1day_shifted = temp_df_eval_chattanooga[["date", "y_pred_t2m_max_1_day_later"]].copy()
+test_pred_1day_shifted['date'] = test_pred_1day_shifted['date'] + pd.Timedelta(days=1)
+test_pred_1day_shifted['series'] = "Test Pred (1 day) - Shifted"
+test_pred_1day_shifted = test_pred_1day_shifted.rename(columns={"y_pred_t2m_max_1_day_later": "temperature"})
+plot_df_shifted.append(test_pred_1day_shifted)
+
+plot_df_shifted = pd.concat(plot_df_shifted, ignore_index=True)
+
+color_map_shifted = {
+    "Actual (Today's Max)": "black",
+    "Test Actual (1 day)": base_blue_1,
+    "Test Pred (1 day) - Shifted": "red",
+}
+
+line_dash_map_shifted = {
+    "Actual (Today's Max)": "solid",
+    "Test Actual (1 day)": "solid",
+    "Test Pred (1 day) - Shifted": "dash",
+}
+
+fig_shifted = px.line(
+    plot_df_shifted,
+    x="date",
+    y="temperature",
+    color="series",
+    title=f"XGBoost 1-Day Forecast Accuracy for {city} (Trained on Multiple Cities) - Shifted Prediction", # Adjusted title
+    template="plotly_white",
+    color_discrete_map=color_map_shifted,
+    line_dash_map=line_dash_map_shifted
+)
+fig_shifted.update_layout(xaxis_title="Date", yaxis_title="T2M max (°C)")
+fig_shifted.show()
+```
+
+
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Choose the model for which you want to display feature importance
+# Let's start with the 1-day forecast model
+model_1day_forecast = models["t2m_max_1_day_later"]
+
+# Get feature importances
+# XGBoost stores them as a numpy array, corresponding to the order of feature_cols
+feature_importances = model_1day_forecast.feature_importances_
+
+# Create a DataFrame for better visualization and sorting
+importance_df = pd.DataFrame({
+    'Feature': feature_cols, # Use the global feature_cols list
+    'Importance': feature_importances
+})
+
+# Sort features by importance in descending order
+importance_df = importance_df.sort_values(by='Importance', ascending=False)
+
+print(f"Feature Importances for {target_cols[0]}:")
+print(importance_df.head(20)) # Print top 20 features
+
+# Plotting the top N feature importances
+plt.figure(figsize=(12, 8))
+sns.barplot(x='Importance', y='Feature', data=importance_df.head(20), palette='viridis')
+plt.title(f'Top 20 Feature Importances for {target_cols[0]} Model')
+plt.xlabel('Importance (F-score or Gain)')
+plt.ylabel('Feature')
+plt.grid(axis='x', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+
+# You can repeat this for other models (3-day and 5-day) if desired
+# model_3day_forecast = models["t2m_max_3_days_later"]
+# model_5day_forecast = models["t2m_max_5_days_later"]
+# ... and generate importance_df and plots for them
+```
