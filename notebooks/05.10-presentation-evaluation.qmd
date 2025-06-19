@@ -1,0 +1,785 @@
+---
+title: "Comprehensive Weather Forecast Model Comparison: Chattanooga T2M"
+subtitle: "An XGBoost Approach to Multi-Day Temperature Forecasting"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show code"
+execute:
+  warning: false 
+  env:
+    PYTHONWARNINGS: "ignore"
+jupyter: python3
+---
+
+# 1. Introduction and Model Objectives
+
+This document presents a comparative analysis of different XGBoost modeling strategies for forecasting daily mean temperature (T2M) in Chattanooga, TN, for 1 to 5 days ahead. Our primary objective is to evaluate the impact of various feature engineering techniques and model architectures on forecast accuracy.
+
+### We will compare four distinct models:
+
+* **Bare Bones Baseline:** A minimalist model using only T2M lags and basic time features.
+* **Full Features (Non-Cascading):** Utilizes all engineered features (derived, intra-city lags, cross-city lags, rolling windows) but trains independent models for each forecast horizon.
+* **Cascading Forecasts:** Employs the full feature set and a sequential training strategy, where predictions from earlier horizons are fed as features to later horizons.
+* **Native Multi-Output:** Uses the full feature set with XGBoost's native multi-output tree strategy, aiming to learn interdependencies between all horizons in a single, unified model.
+
+## 2. Common Data Loading and Feature Engineering Pipeline
+
+This section defines the shared data acquisition and feature engineering steps that are applied consistently to all models for a fair, "apples-to-apples" comparison. This includes loading data for Chattanooga and all surrounding cities, calculating derived features, intra-city lags, cross-city lags, and rolling window features.
+
+### Data
+This experiment uses data from the NASA Power data base accessed through the API. Surrounding cities data was also used: **Scottsboro, Jasper, Winchester, Cleveland, Dalton, Athens, Fort Payne, Dayton, Ringgold**
+
+```{python}
+#| echo: false
+#| results: 'hide'
+#| message: false
+#| warning: false
+#| cache: true
+import os, warnings
+
+# Quarto env var covers C-level warns, this covers everything in Python
+os.environ["PYTHONWARNINGS"] = "ignore"
+warnings.filterwarnings("ignore")
+
+# --- SECTION 0. Parameters (Common to all models) ---
+from pathlib import Path
+
+target_city_name = "Chattanooga"
+train_start      = "2000-01-01"  # inclusive
+train_end        = "2022-12-31"  # inclusive
+test_start       = "2023-01-01"  # inclusive
+test_end         = "2024-12-31"  # inclusive
+forecast_horizon = None          # not used
+
+surrounding_cities = ["Scottsboro", "Jasper", "Winchester", 
+                      "Cleveland", "Dalton", "Athens", "Fort Payne", "Dayton", "Ringgold"] 
+
+project_root = Path().resolve().parent
+db_path      = project_root / "weather.duckdb"
+
+#assert db_path.exists(), f"DuckDB not found at {db_path}"
+#print(f"DB path: {db_path}\nTarget City: {target_city_name}\nSurrounding Cities: {surrounding_cities}")
+print(f"Train window: {train_start} → {train_end}\nTest window: {test_start} → {test_end}")
+
+# --- SECTION 1. Load & Clean Data (Common to all models) ---
+import duckdb
+import pandas as pd
+
+all_cities_to_load = [target_city_name] + surrounding_cities
+
+query = f"""
+SELECT
+  date,
+  location, 
+  t2m, t2m_max, t2m_min, t2m_range, dewpoint, rh2m, ws10m, wd10m, ps, 
+  allsky_sw_dwn, allsky_lw_dwn, prectotcorr
+FROM weather
+WHERE location IN ({str(all_cities_to_load)[1:-1]})
+  AND date BETWEEN '{train_start}' AND '{test_end}'
+ORDER BY date, location
+"""
+df_all_cities_raw = duckdb.connect(str(db_path)).execute(query).fetchdf()
+
+numeric_cols_raw = [
+    "t2m","t2m_max","t2m_min","t2m_range","dewpoint","rh2m","ws10m",
+    "wd10m","ps","allsky_sw_dwn","allsky_lw_dwn","prectotcorr"
+]
+df_all_cities_raw["date"] = pd.to_datetime(df_all_cities_raw["date"])
+df_all_cities_raw = df_all_cities_raw[(df_all_cities_raw[numeric_cols_raw]!= -999).all(axis=1)]
+
+#print(f"\nAfter initial cleaning (all cities): {df_all_cities_raw.shape[0]} rows")
+#print(f"Loaded unique locations: {df_all_cities_raw['location'].unique()}")
+
+
+# --- SECTION 2. Feature Engineering (Common to all models) ---
+import numpy as np
+
+df_all_cities = df_all_cities_raw.copy() # Start fresh with a copy to reduce fragmentation from previous steps
+
+df_all_cities["date_ordinal"] = df_all_cities["date"].map(pd.Timestamp.toordinal)
+df_all_cities["day_of_year"] = df_all_cities["date"].dt.dayofyear
+df_all_cities["doy_sin"] = np.sin(2 * np.pi * df_all_cities["day_of_year"] / 365)
+df_all_cities["doy_cos"] = np.cos(2 * np.pi * df_all_cities["day_of_year"] / 365)
+
+# Additional Calculable Features
+df_all_cities['t2m_ratio_to_t2m_min'] = df_all_cities['t2m'] / df_all_cities['t2m_min']
+df_all_cities.replace([np.inf, -np.inf], np.nan, inplace=True) 
+df_all_cities['t2m_dewpoint_spread'] = df_all_cities['t2m'] - df_all_cities['dewpoint']
+df_all_cities['t2m_avg_from_max_min'] = (df_all_cities['t2m_max'] + df_all_cities['t2m_min']) / 2
+df_all_cities['ps_change_24hr'] = df_all_cities.groupby('location')['ps'].diff(periods=1)
+df_all_cities['wind_u'] = df_all_cities['ws10m'] * np.sin(np.radians(df_all_cities['wd10m']))
+df_all_cities['wind_v'] = df_all_cities['ws10m'] * np.cos(np.radians(df_all_cities['wd10m']))
+df_all_cities['t2m_range_normalized'] = df_all_cities['t2m_range'] / df_all_cities['t2m']
+df_all_cities.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+# Intra-City Lag Features
+intra_city_dynamic_features = [
+    "t2m", "t2m_min", "t2m_max", "t2m_range", "dewpoint", "rh2m",
+    "ws10m", "wd10m", "ps", "allsky_sw_dwn", "allsky_lw_dwn", "prectotcorr",
+    "t2m_ratio_to_t2m_min", "t2m_dewpoint_spread", "t2m_avg_from_max_min",
+    "ps_change_24hr", "wind_u", "wind_v", "t2m_range_normalized"
+]
+intra_city_lags = [1, 2, 3, 4, 5, 6, 7] 
+for feature in intra_city_dynamic_features:
+    for lag in intra_city_lags:
+        df_all_cities[f"{feature}_lag_{lag}"] = df_all_cities.groupby('location')[feature].shift(lag)
+
+df_all_cities = df_all_cities.copy() # Defragment after intra-city lags
+
+# Cross-City Lag Features (merged onto target_city_features)
+cross_city_features_to_lag = ["t2m", "ps", "wind_u", "wind_v", "t2m_avg_from_max_min"]
+cross_city_lags = [1, 2] 
+df_target_city_features = df_all_cities[df_all_cities['location'] == target_city_name].copy()
+for other_city in surrounding_cities:
+    df_other_city = df_all_cities[df_all_cities['location'] == other_city].copy()
+    for feature in cross_city_features_to_lag:
+        for lag in cross_city_lags:
+            lagged_col_name = f"{other_city.lower()}_{feature}_lag_{lag}"
+            lagged_data = df_other_city[['date', feature]].copy()
+            lagged_data['date'] = lagged_data['date'] + pd.Timedelta(days=lag) 
+            lagged_data = lagged_data.rename(columns={feature: lagged_col_name})
+            df_target_city_features = pd.merge(df_target_city_features, lagged_data[['date', lagged_col_name]], on='date', how='left')
+
+df_target_city_features = df_target_city_features.copy() # Defragment after cross-city merges
+
+# Rolling Window Features (for TARGET_CITY only)
+rolling_features_to_calculate = ["t2m", "dewpoint", "ps", "prectotcorr", "t2m_avg_from_max_min"]
+rolling_windows = [3, 7] 
+rolling_stats = ['mean', 'std'] 
+df_target_city_features = df_target_city_features.sort_values(by='date').reset_index(drop=True)
+for feature in rolling_features_to_calculate:
+    for window in rolling_windows:
+        rolling_series = df_target_city_features[feature].rolling(window=window, min_periods=1)
+        if 'mean' in rolling_stats: df_target_city_features[f"{feature}_roll_mean_{window}d"] = rolling_series.mean()
+        if 'std' in rolling_stats: df_target_city_features[f"{feature}_roll_std_{window}d"] = rolling_series.std()
+
+df_target_city_features = df_target_city_features.copy() # Defragment after rolling calculations
+
+# Final Target Creation
+df_target_city_features["t2m_1_day_later"] = df_target_city_features["t2m"].shift(-1)
+df_target_city_features["t2m_2_days_later"] = df_target_city_features["t2m"].shift(-2)
+df_target_city_features["t2m_3_days_later"] = df_target_city_features["t2m"].shift(-3)
+df_target_city_features["t2m_4_days_later"] = df_target_city_features["t2m"].shift(-4)
+df_target_city_features["t2m_5_days_later"] = df_target_city_features["t2m"].shift(-5)
+
+# --- Feature and Target Columns Definitions (Global for subsequent sections) ---
+base_feature_cols = [
+    "date_ordinal", "day_of_year", "doy_sin", "doy_cos",
+    "t2m", "t2m_min", "t2m_max", "t2m_range", "dewpoint", "rh2m",
+    "ws10m", "wd10m", "ps", "allsky_sw_dwn", "allsky_lw_dwn", "prectotcorr",
+    "t2m_ratio_to_t2m_min", "t2m_dewpoint_spread", "t2m_avg_from_max_min",
+    "ps_change_24hr", "wind_u", "wind_v", "t2m_range_normalized"
+]
+full_feature_set_cols = list(base_feature_cols) 
+for feature in intra_city_dynamic_features:
+    for lag in intra_city_lags: full_feature_set_cols.append(f"{feature}_lag_{lag}")
+for other_city in surrounding_cities:
+    for feature in cross_city_features_to_lag:
+        for lag in cross_city_lags: full_feature_set_cols.append(f"{other_city.lower()}_{feature}_lag_{lag}")
+for feature in rolling_features_to_calculate:
+    for window in rolling_windows:
+        if 'mean' in rolling_stats: full_feature_set_cols.append(f"{feature}_roll_mean_{window}d")
+        if 'std' in rolling_stats: full_feature_set_cols.append(f"{feature}_roll_std_{window}d")
+
+target_cols_all_horizons = ["t2m_1_day_later", "t2m_2_days_later", "t2m_3_days_later", "t2m_4_days_later", "t2m_5_days_later"]
+
+# --- Handle NaNs from all feature engineering and target shifts ---
+all_cols_to_check_for_nan = list(target_cols_all_horizons) 
+all_cols_to_check_for_nan.extend(full_feature_set_cols) 
+original_rows_before_dropna = df_target_city_features.shape[0]
+df_final = df_target_city_features.dropna(subset=all_cols_to_check_for_nan).copy()
+print(f"\nDropped {original_rows_before_dropna - df_final.shape[0]} rows due to NaNs after all feature engineering.")
+print(f"Final data shape after engineering & dropna: {df_final.shape[0]} rows, {df_final.shape[1]} columns")
+
+
+# --- SECTION 3. Train/Test Split (Common to all models) ---
+mask_train = (df_final["date"] >= train_start) & (df_final["date"] <= train_end)
+mask_test  = (df_final["date"] >= test_start)  & (df_final["date"] <= test_end)
+
+train_df = df_final[mask_train].reset_index(drop=True)
+test_df  = df_final[mask_test].reset_index(drop=True)
+
+print(f"\nTrain rows: {train_df.shape[0]}\nTest rows: {test_df.shape[0]}")
+
+# --- GLOBAL PLOTTING COLOR/DASH MAPS (Defined once for consistency) ---
+base_blue_1 = "#007BFF" # Darker blue
+base_blue_2 = "#3399FF" # Slightly lighter
+base_blue_3 = "#66B2FF" # Medium blue
+base_blue_4 = "#99CCFF" # Lighter
+base_blue_5 = "#ADD8FF" # Lightest blue
+
+color_map_plot = { # Used for main prediction plots
+    "Actual (Today's Mean Temp)": "black",
+    "Train (t2m_1 day(s))": "#7a9cb2", "Train (t2m_2 day(s))": "#8bb0c4", "Train (t2m_3 day(s))": "#a0b7c7",
+    "Train (t2m_4 day(s))": "#b5cdd2", "Train (t2m_5 day(s))": "#c5d2db",
+    "Test Actual (1 day(s))": base_blue_1, "Test Actual (2 day(s))": base_blue_2, "Test Actual (3 day(s))": base_blue_3,
+    "Test Actual (4 day(s))": base_blue_4, "Test Actual (5 day(s))": base_blue_5, 
+    "Test Pred (1 day(s))": "#3399FF", "Test Pred (2 day(s))": "#66CCFF", "Test Pred (3 day(s))": "#99CCFF",
+    "Test Pred (4 day(s))": "#C5E3FF", "Test Pred (5 day(s))": "#E0F2FF",
+}
+line_dash_map_plot = { # Used for main prediction plots
+    "Actual (Today's Mean Temp)": "solid",
+    "Train (t2m_1 day(s))": "dot", "Train (t2m_2 day(s))": "dot", "Train (t2m_3 day(s))": "dot",
+    "Train (t2m_4 day(s))": "dot", "Train (t2m_5 day(s))": "dot",
+    "Test Actual (1 day(s))": "solid", "Test Actual (2 day(s))": "solid", "Test Actual (3 day(s))": "solid",
+    "Test Actual (4 day(s))": "solid", "Test Actual (5 day(s))": "solid",
+    "Test Pred (1 day(s))": "dash", "Test Pred (2 day(s))": "dash", "Test Pred (3 day(s))": "dash",
+    "Test Pred (4 day(s))": "dash", "Test Pred (5 day(s))": "dash",
+}
+error_color_map_plot = { # Used for error plots
+    "Error (1 day(s))": "blue", "Error (2 day(s))": "#4CAF50", "Error (3 day(s))": "green",
+    "Error (4 day(s))": "#FFC107", "Error (5 day(s))": "red",
+}
+
+# --- Initialize Global Results Collector ---
+all_model_comparison_results = []
+```
+
+```{python}
+import plotly.express as px 
+import pandas as pd 
+
+# Combine train and test data for the context plot
+context_plot_df = pd.concat([
+    train_df[['date', 't2m']].assign(dataset='Train Data'),
+    test_df[['date', 't2m']].assign(dataset='Test Data')
+], ignore_index=True)
+
+train_context_fig = px.line(
+    context_plot_df, x="date", y="t2m", color="dataset", # <-- This line was cut off before
+    title=f"Actual Mean Temperature for {target_city_name} (Train vs. Test Data)", # <-- Full title restored
+    template="plotly_white",
+    color_discrete_map={'Train Data': 'blue', 'Test Data': 'red'} # <-- This was missing
+)
+train_context_fig.update_layout(height=400, xaxis_title="Date", yaxis_title="T2M Mean Temp (°C)") # <-- This was missing
+train_context_fig.show() # <-- This was missing
+```
+
+# Model evaluation ---------------
+
+## 3. Model 1: Bare Bones Baseline (04.000)
+This model serves as a minimalist benchmark. It uses only **t2m** (current day) and its lags (1-7 days), along with basic time-based features (**date_ordinal, doy_sin, doy_cos**) from Chattanooga. All other complex features are excluded. It's trained using the **MultiOutputRegressor** strategy.
+
+
+```{python, cache: true}
+
+from xgboost import XGBRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, max_error
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+# --- Define Bare Bones Model's specific feature set ---
+bare_bones_feature_cols = ["date_ordinal", "doy_sin", "doy_cos", "t2m"]
+for lag in range(1, 8): # t2m_lag_1 to t2m_lag_7
+    bare_bones_feature_cols.append(f"t2m_lag_{lag}")
+
+# --- SECTION 4. Train XGBoost Model (Bare Bones) ---
+# Prepare arrays for multi-output training
+iX_train_bare = train_df[bare_bones_feature_cols]
+iy_train_bare = train_df[target_cols_all_horizons] # All 5 targets
+
+xgb_base_model_bare = XGBRegressor(n_estimators=100, learning_rate=0.1, random_state=0)
+multi_output_model_bare = MultiOutputRegressor(estimator=xgb_base_model_bare, n_jobs=-1)
+print(f"\n--- Training Bare Bones Model for targets: {target_cols_all_horizons} ---")
+multi_output_model_bare.fit(iX_train_bare, iy_train_bare)
+models_bare = {"multi_output_model": multi_output_model_bare} 
+
+# --- SECTION 5. Forecast & Evaluate (Bare Bones) ---
+df_eval_bare = pd.DataFrame({"date": test_df["date"]})
+X_test_bare = test_df[bare_bones_feature_cols]
+y_pred_all_targets_bare = models_bare["multi_output_model"].predict(X_test_bare)
+
+current_model_results = [] 
+
+for i, target_col in enumerate(target_cols_all_horizons):
+    df_eval_bare[f"y_true_{target_col}"] = test_df[target_col]
+    df_eval_bare[f"y_pred_{target_col}"] = y_pred_all_targets_bare[:, i]
+
+    y_true = df_eval_bare[f"y_true_{target_col}"]
+    y_pred = df_eval_bare[f"y_pred_{target_col}"]
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    max_err = max_error(y_true, y_pred)
+    
+    current_model_results.append({
+        'Model': 'Bare Bones',
+        'Horizon': target_col.replace('t2m_', '').replace('_later', ' day(s)'),
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'Max_Error': max_err
+    })
+
+all_model_comparison_results.extend(current_model_results)
+
+print("\n--- Metrics for Bare Bones Model (Test Set) ---")
+display(pd.DataFrame(current_model_results)) 
+
+# --- SECTION 6.0 Plot Results (Bare Bones) ---
+# MODIFIED: Remove train data
+plot_df_list_bare = []
+# MODIFIED: Source Actual (Today's Mean Temp) from df_eval_bare for test period only
+plot_df_list_bare.append(df_eval_bare[["date", f"y_true_{target_cols_all_horizons[0]}"]].assign(series="Actual (Today's Mean Temp)").rename(columns={f"y_true_{target_cols_all_horizons[0]}": "temperature"}))
+for target_col in target_cols_all_horizons:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    # Removed: plot_df_list_bare.append(train_df[["date", target_col]].assign(series=f"Train (t2m_{horizon_name})").rename(columns={target_col: "temperature"}))
+    plot_df_list_bare.append(df_eval_bare[["date", f"y_true_{target_col}"]].assign(series=f"Test Actual ({horizon_name})").rename(columns={f"y_true_{target_col}": "temperature"}))
+    plot_df_list_bare.append(df_eval_bare[["date", f"y_pred_{target_col}"]].assign(series=f"Test Pred ({horizon_name})").rename(columns={f"y_pred_{target_col}": "temperature"}))
+plot_df_bare = pd.concat(plot_df_list_bare, ignore_index=True)
+
+fig_bare = px.line(plot_df_bare, x="date", y="temperature", color="series", 
+                   title=f"XGBoost Bare Bones Baseline for {target_city_name} - T2M Forecasts", 
+                   template="plotly_white", color_discrete_map=color_map_plot, line_dash_map=line_dash_map_plot)
+fig_bare.update_layout(height=600, xaxis_title="Date", yaxis_title="T2M Mean Temp (°C)")
+fig_bare.show()
+
+# --- SECTION 6.1 Plot differences (Bare Bones) ---
+plot_error_df_list_bare = []
+for target_col in target_cols_all_horizons:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    error_col = f"error_{horizon_name}"
+    df_eval_bare[error_col] = df_eval_bare[f"y_true_{target_col}"] - df_eval_bare[f"y_pred_{target_col}"]
+    plot_error_df_list_bare.append(df_eval_bare[["date", error_col]].assign(series=f"Error ({horizon_name})").rename(columns={error_col: "error"}))
+plot_error_df_bare = pd.concat(plot_error_df_list_bare, ignore_index=True)
+fig_error_bare = px.line(plot_error_df_bare, x="date", y="error", color="series", 
+                         title=f"Forecast Error for {target_city_name} (Test Set - Bare Bones)", 
+                         labels={"error": "Prediction Error (°C)", "date": "Date"}, 
+                         template="plotly_white", color_discrete_map=error_color_map_plot)
+fig_error_bare.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Zero Error")
+fig_error_bare.update_layout(height=600)
+fig_error_bare.show()
+
+# --- SECTION 6.2 Feature Importance (Bare Bones) ---
+model_multi_output_bare = models_bare["multi_output_model"]
+feature_importances_bare = model_multi_output_bare.estimators_[0].feature_importances_ 
+importance_df_bare = pd.DataFrame({'Feature': bare_bones_feature_cols, 'Importance': feature_importances_bare})
+importance_df_bare = importance_df_bare.sort_values(by='Importance', ascending=False)
+print(f"\n--- Top 20 Feature Importances for Bare Bones Model (Target: t2m_1_day_later) ---")
+print(importance_df_bare.head(20))
+plt.figure(figsize=(12, 8))
+sns.barplot(x='Importance', y='Feature', data=importance_df_bare.head(20), palette='viridis')
+plt.title(f'Top 20 Feature Importances for Bare Bones Model (t2m_1_day_later)')
+plt.xlabel('Importance (F-score or Gain)')
+plt.ylabel('Feature')
+plt.grid(axis='x', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+```
+
+## 4. Model 2: Full Features (Non-Cascading - from 03.621)
+This model utilizes all engineered features (derived, intra-city lags, cross-city from all 9 cities, and rolling windows) but trains independent models for each forecast horizon (via MultiOutputRegressor).
+
+```{python, cache: true}
+from xgboost import XGBRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, max_error
+
+# --- SECTION 4. Train XGBoost Model (Full Features, Non-Cascading) ---
+iX_train_full_noncascading = train_df[full_feature_set_cols]
+iy_train_full_noncascading = train_df[target_cols_all_horizons]
+
+xgb_base_model_full_noncascading = XGBRegressor(n_estimators=100, learning_rate=0.1, random_state=0)
+multi_output_model_full_noncascading = MultiOutputRegressor(estimator=xgb_base_model_full_noncascading, n_jobs=-1)
+print(f"\n--- Training Full Features (Non-Cascading) Model for targets: {target_cols_all_horizons} ---")
+multi_output_model_full_noncascading.fit(iX_train_full_noncascading, iy_train_full_noncascading)
+models_full_noncascading = {"multi_output_model": multi_output_model_full_noncascading} 
+
+# --- SECTION 5. Forecast & Evaluate (Full Features, Non-Cascading) ---
+df_eval_full_noncascading = pd.DataFrame({"date": test_df["date"]})
+X_test_full_noncascading = test_df[full_feature_set_cols]
+y_pred_all_targets_full_noncascading = models_full_noncascading["multi_output_model"].predict(X_test_full_noncascading)
+
+current_model_results = [] 
+
+for i, target_col in enumerate(target_cols_all_horizons):
+    df_eval_full_noncascading[f"y_true_{target_col}"] = test_df[target_col]
+    df_eval_full_noncascading[f"y_pred_{target_col}"] = y_pred_all_targets_full_noncascading[:, i]
+
+    y_true = df_eval_full_noncascading[f"y_true_{target_col}"]
+    y_pred = df_eval_full_noncascading[f"y_pred_{target_col}"]
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    max_err = max_error(y_true, y_pred)
+    
+    current_model_results.append({
+        'Model': 'Full Features (Non-Cascading)',
+        'Horizon': target_col.replace('t2m_', '').replace('_later', ' day(s)'),
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'Max_Error': max_err
+    })
+
+all_model_comparison_results.extend(current_model_results)
+
+print(f"\n--- Metrics for Full Features (Non-Cascading) Model (Test Set) ---")
+display(pd.DataFrame(current_model_results))
+
+# --- SECTION 6.0 Plot Results (Full Features, Non-Cascading) ---
+# MODIFIED: Removed train data
+plot_df_list_full_noncascading = []
+# MODIFIED: Source Actual (Today's Mean Temp) from df_eval_full_noncascading for test period only
+plot_df_list_full_noncascading.append(df_eval_full_noncascading[["date", f"y_true_{target_cols_all_horizons[0]}"]].assign(series="Actual (Today's Mean Temp)").rename(columns={f"y_true_{target_cols_all_horizons[0]}": "temperature"}))
+for target_col in target_cols_all_horizons:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    # Removed: plot_df_list_full_noncascading.append(train_df[["date", target_col]].assign(series=f"Train (t2m_{horizon_name})").rename(columns={target_col: "temperature"}))
+    plot_df_list_full_noncascading.append(df_eval_full_noncascading[["date", f"y_true_{target_col}"]].assign(series=f"Test Actual ({horizon_name})").rename(columns={f"y_true_{target_col}": "temperature"}))
+    plot_df_list_full_noncascading.append(df_eval_full_noncascading[["date", f"y_pred_{target_col}"]].assign(series=f"Test Pred ({horizon_name})").rename(columns={f"y_pred_{target_col}": "temperature"}))
+plot_df_full_noncascading = pd.concat(plot_df_list_full_noncascading, ignore_index=True)
+
+fig_full_noncascading = px.line(plot_df_full_noncascading, x="date", y="temperature", color="series", 
+                                title=f"XGBoost Full Features (Non-Cascading) for {target_city_name} - T2M Forecasts", 
+                                template="plotly_white", color_discrete_map=color_map_plot, line_dash_map=line_dash_map_plot)
+fig_full_noncascading.update_layout(height=600, xaxis_title="Date", yaxis_title="T2M Mean Temp (°C)")
+fig_full_noncascading.show()
+
+# --- SECTION 6.1 Plot differences (Full Features, Non-Cascading) ---
+plot_error_df_list_full_noncascading = []
+for target_col in target_cols_all_horizons:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    error_col = f"error_{horizon_name}"
+    df_eval_full_noncascading[error_col] = df_eval_full_noncascading[f"y_true_{target_col}"] - df_eval_full_noncascading[f"y_pred_{target_col}"]
+    plot_error_df_list_full_noncascading.append(df_eval_full_noncascading[["date", error_col]].assign(series=f"Error ({horizon_name})").rename(columns={error_col: "error"}))
+plot_error_df_full_noncascading = pd.concat(plot_error_df_list_full_noncascading, ignore_index=True)
+fig_error_full_noncascading = px.line(plot_error_df_full_noncascading, x="date", y="error", color="series", 
+                                     title=f"Forecast Error for {target_city_name} (Test Set - Full Features, Non-Cascading)", 
+                                     labels={"error": "Prediction Error (°C)", "date": "Date"}, 
+                                     template="plotly_white", color_discrete_map=error_color_map_plot)
+fig_error_full_noncascading.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Zero Error")
+fig_error_full_noncascading.update_layout(height=600)
+fig_error_full_noncascading.show()
+
+# --- SECTION 6.2 Feature Importance (Full Features, Non-Cascading) ---
+print(f"\n--- Feature Importances for Full Features (Non-Cascading) Model ---")
+for i, target_col in enumerate(target_cols_all_horizons):
+    model_for_importance_full_noncascading = models_full_noncascading["multi_output_model"].estimators_[i]
+    feature_importances_full_noncascading = model_for_importance_full_noncascading.feature_importances_
+    importance_df_full_noncascading = pd.DataFrame({'Feature': full_feature_set_cols, 'Importance': feature_importances_full_noncascading})
+    importance_df_full_noncascading = importance_df_full_noncascading.sort_values(by='Importance', ascending=False)
+    print(f"\nFeature Importances for {target_col} (Full Features, Non-Cascading):")
+    print(importance_df_full_noncascading.head(20))
+    plt.figure(figsize=(12, 8))
+    sns.barplot(x='Importance', y='Feature', data=importance_df_full_noncascading.head(20), palette='viridis')
+    plt.title(f'Top 20 Feature Importances for {target_col} (Full Features, Non-Cascading)')
+    plt.xlabel('Importance (F-score or Gain)')
+    plt.ylabel('Feature')
+    plt.grid(axis='x', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+```
+
+## 5. Model 3: Cascading Forecasts (03.650)
+This model builds on the full feature set (derived, intra-city lags, cross-city from all 9 cities, and rolling windows) but uses a sequential training strategy, where predictions from earlier horizons are fed as features to later horizons.
+
+```{python, cache: true}
+from xgboost import XGBRegressor
+from sklearn.base import clone 
+
+# --- SECTION 4. Train Cascading XGBoost Models ---
+models_cascading = {} 
+train_pred_features_df_cascading = pd.DataFrame(index=train_df.index) 
+test_pred_features_df_cascading = pd.DataFrame(index=test_df.index)
+
+xgb_base_model_cascading = XGBRegressor(n_estimators=100, learning_rate=0.1, random_state=0)
+
+current_feature_cols_cascading_training = list(full_feature_set_cols) 
+
+for i, target_col in enumerate(target_cols_all_horizons):
+    print(f"\n--- Training Cascading Model for {target_col} ---")
+    iX_train_cascading = train_df[current_feature_cols_cascading_training]
+    iy_train_cascading = train_df[target_col]
+    
+    model_cascading = clone(xgb_base_model_cascading) 
+    
+    print(f"Features used for {target_col}: {len(current_feature_cols_cascading_training)} features")
+    model_cascading.fit(iX_train_cascading, iy_train_cascading)
+    models_cascading[target_col] = model_cascading 
+
+    train_preds_cascading = model_cascading.predict(train_df[current_feature_cols_cascading_training])
+    new_pred_feature_name = f"predicted_{target_col}"
+    train_pred_features_df_cascading[new_pred_feature_name] = train_preds_cascading
+    
+    test_preds_cascading = model_cascading.predict(test_df[current_feature_cols_cascading_training])
+    test_pred_features_df_cascading[new_pred_feature_name] = test_preds_cascading
+
+    if i < len(target_cols_all_horizons) - 1:
+        current_feature_cols_cascading_training.append(new_pred_feature_name)
+        train_df[new_pred_feature_name] = train_pred_features_df_cascading[new_pred_feature_name]
+        test_df[new_pred_feature_name] = test_pred_features_df_cascading[new_pred_feature_name]
+
+print("\nAll cascading models trained.")
+
+# --- SECTION 5. Forecast & Evaluate (Cascading) ---
+df_eval_cascading = pd.DataFrame({"date": test_df["date"]})
+
+current_model_results = [] 
+
+for target_col in target_cols_all_horizons:
+    df_eval_cascading[f"y_true_{target_col}"] = test_df[target_col]
+    df_eval_cascading[f"y_pred_{target_col}"] = test_pred_features_df_cascading[f"predicted_{target_col}"]
+
+    y_true = df_eval_cascading[f"y_true_{target_col}"]
+    y_pred = df_eval_cascading[f"y_pred_{target_col}"]
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    max_err = max_error(y_true, y_pred)
+    
+    current_model_results.append({
+        'Model': 'Cascading',
+        'Horizon': target_col.replace('t2m_', '').replace('_later', ' day(s)'),
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'Max_Error': max_err
+    })
+
+all_model_comparison_results.extend(current_model_results)
+
+print(f"\n--- Metrics for Cascading Model (Test Set) ---")
+display(pd.DataFrame(current_model_results))
+
+# --- SECTION 6.0 Plot Results (Cascading) ---
+# MODIFIED: Removed train data
+plot_df_list_cascading = []
+# MODIFIED: Source Actual (Today's Mean Temp) from df_eval_cascading for test period only
+plot_df_list_cascading.append(df_eval_cascading[["date", f"y_true_{target_cols_all_horizons[0]}"]].assign(series="Actual (Today's Mean Temp)").rename(columns={f"y_true_{target_cols_all_horizons[0]}": "temperature"}))
+for target_col in target_cols_all_horizons:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    # Removed: plot_df_list_cascading.append(train_df[["date", target_col]].assign(series=f"Train (t2m_{horizon_name})").rename(columns={target_col: "temperature"}))
+    plot_df_list_cascading.append(df_eval_cascading[["date", f"y_true_{target_col}"]].assign(series=f"Test Actual ({horizon_name})").rename(columns={f"y_true_{target_col}": "temperature"}))
+    plot_df_list_cascading.append(df_eval_cascading[["date", f"y_pred_{target_col}"]].assign(series=f"Test Pred ({horizon_name})").rename(columns={f"y_pred_{target_col}": "temperature"}))
+plot_df_cascading = pd.concat(plot_df_list_cascading, ignore_index=True)
+
+fig_cascading = px.line(plot_df_cascading, x="date", y="temperature", color="series", 
+                        title=f"XGBoost Cascading Forecasts for {target_city_name} - T2M Forecasts", 
+                        template="plotly_white", color_discrete_map=color_map_plot, line_dash_map=line_dash_map_plot)
+fig_cascading.update_layout(height=600, xaxis_title="Date", yaxis_title="T2M Mean Temp (°C)")
+fig_cascading.show()
+
+# --- SECTION 6.1 Plot differences (Cascading) ---
+plot_error_df_list_cascading = []
+for target_col in target_cols_all_horizons:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    error_col = f"error_{horizon_name}"
+    df_eval_cascading[error_col] = df_eval_cascading[f"y_true_{target_col}"] - df_eval_cascading[f"y_pred_{target_col}"]
+    plot_error_df_list_cascading.append(df_eval_cascading[["date", error_col]].assign(series=f"Error ({horizon_name})").rename(columns={error_col: "error"}))
+plot_error_df_cascading = pd.concat(plot_error_df_list_cascading, ignore_index=True)
+fig_error_cascading = px.line(plot_error_df_cascading, x="date", y="error", color="series", 
+                              title=f"Forecast Error for {target_city_name} (Test Set - Cascading)", 
+                              labels={"error": "Prediction Error (°C)", "date": "Date"}, 
+                              template="plotly_white", color_discrete_map=error_color_map_plot)
+fig_error_cascading.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Zero Error")
+fig_error_cascading.update_layout(height=600)
+fig_error_cascading.show()
+
+# --- SECTION 6.2 Feature Importance (Cascading) ---
+print(f"\n--- Feature Importances for Cascading Models ---")
+for i, target_col in enumerate(target_cols_all_horizons):
+    model_for_importance_cascading = models_cascading[target_col]
+    feature_importances_cascading = model_for_importance_cascading.feature_importances_
+    
+    model_specific_feature_cols_cascading = list(full_feature_set_cols) 
+    for prev_i in range(i):
+        model_specific_feature_cols_cascading.append(f"predicted_{target_cols_all_horizons[prev_i]}")
+
+    importance_df_cascading = pd.DataFrame({'Feature': model_specific_feature_cols_cascading, 'Importance': feature_importances_cascading})
+    importance_df_cascading = importance_df_cascading.sort_values(by='Importance', ascending=False)
+    print(f"\nFeature Importances for {target_col} (Cascading):")
+    print(importance_df_cascading.head(20))
+    plt.figure(figsize=(12, 8))
+    sns.barplot(x='Importance', y='Feature', data=importance_df_cascading.head(20), palette='viridis')
+    plt.title(f'Top 20 Feature Importances for {target_col} (Cascading)')
+    plt.xlabel('Importance (F-score or Gain)')
+    plt.ylabel('Feature')
+    plt.grid(axis='x', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+```
+
+## 6. Model 4: Native Multi-Output (03.730)
+This model uses the full feature set with XGBoost's native multi-output tree strategy, aiming to learn interdependencies between all 5 horizons in a single, unified model.
+
+```{python, cache: true}
+from xgboost import XGBRegressor
+
+from xgboost import XGBRegressor
+
+# --- SECTION 4. Train XGBoost Model (Native Multi-Output) ---
+iX_train_native = train_df[full_feature_set_cols]
+iy_train_native = train_df[target_cols_all_horizons]
+
+xgb_native_multi_output_model = XGBRegressor(
+    n_estimators=100,
+    learning_rate=0.1,
+    random_state=0,
+    tree_method="hist",
+    multi_strategy="multi_output_tree"
+)
+
+print(f"\n--- Training Native Multi-Output Model for targets: {target_cols_all_horizons} ---")
+xgb_native_multi_output_model.fit(iX_train_native, iy_train_native)
+models_native_multioutput = {"multi_output_model": xgb_native_multi_output_model} 
+
+# --- SECTION 5. Forecast & Evaluate (Native Multi-Output) ---
+df_eval_native_multioutput = pd.DataFrame({"date": test_df["date"]})
+X_test_native = test_df[full_feature_set_cols]
+y_pred_all_targets_native = models_native_multioutput["multi_output_model"].predict(X_test_native)
+
+current_model_results = [] 
+
+for i, target_col in enumerate(target_cols_all_horizons):
+    df_eval_native_multioutput[f"y_true_{target_col}"] = test_df[target_col]
+    df_eval_native_multioutput[f"y_pred_{target_col}"] = y_pred_all_targets_native[:, i]
+
+    y_true = df_eval_native_multioutput[f"y_true_{target_col}"]
+    y_pred = df_eval_native_multioutput[f"y_pred_{target_col}"]
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    max_err = max_error(y_true, y_pred)
+    
+    print(f"\nMetrics for {target_col} (Native Multi-Output):")
+    print(f"  RMSE: {rmse:.3f}, MAE: {mae:.3f}, R2: {r2:.3f}, Max Error: {max_err:.3f}")
+
+    current_model_results.append({
+        'Model': 'Native Multi-Output',
+        'Horizon': target_col.replace('t2m_', '').replace('_later', ' day(s)'),
+        'RMSE': rmse,
+        'MAE': mae,
+        'R2': r2,
+        'Max_Error': max_err
+    })
+
+all_model_comparison_results.extend(current_model_results)
+
+print(f"\n--- Metrics for Native Multi-Output Model (Test Set) ---")
+display(pd.DataFrame(current_model_results))
+
+# --- SECTION 6.0 Plot Results (Native Multi-Output) ---
+plot_df_list_native = []
+plot_df_list_native.append(df_final[["date", "t2m"]].assign(series="Actual (Today's Mean Temp)").rename(columns={"t2m": "temperature"}))
+for target_col in target_cols_all_horizons:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    plot_df_list_native.append(train_df[["date", target_col]].assign(series=f"Train (t2m_{horizon_name})").rename(columns={target_col: "temperature"}))
+    plot_df_list_native.append(df_eval_native_multioutput[["date", f"y_true_{target_col}"]].assign(series=f"Test Actual ({horizon_name})").rename(columns={f"y_true_{target_col}": "temperature"}))
+    plot_df_list_native.append(df_eval_native_multioutput[["date", f"y_pred_{target_col}"]].assign(series=f"Test Pred ({horizon_name})").rename(columns={f"y_pred_{target_col}": "temperature"}))
+plot_df_native = pd.concat(plot_df_list_native, ignore_index=True)
+
+fig_native = px.line(plot_df_native, x="date", y="temperature", color="series", 
+                     title=f"XGBoost Native Multi-Output for {target_city_name} - T2M Forecasts", 
+                     template="plotly_white", color_discrete_map=color_map_plot, line_dash_map=line_dash_map_plot)
+fig_native.update_layout(height=600, xaxis_title="Date", yaxis_title="T2M Mean Temp (°C)")
+fig_native.show()
+
+# --- SECTION 6.1 Plot differences (Native Multi-Output) ---
+plot_error_df_list_native = []
+for target_col in target_cols_all_horizons:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    error_col = f"error_{horizon_name}"
+    df_eval_native_multioutput[error_col] = df_eval_native_multioutput[f"y_true_{target_col}"] - df_eval_native_multioutput[f"y_pred_{target_col}"]
+    plot_error_df_list_native.append(df_eval_native_multioutput[["date", error_col]].assign(series=f"Error ({horizon_name})").rename(columns={error_col: "error"}))
+plot_error_df_native = pd.concat(plot_error_df_list_native, ignore_index=True)
+fig_error_native = px.line(plot_error_df_native, x="date", y="error", color="series", 
+                           title=f"Forecast Error for {target_city_name} (Test Set - Native Multi-Output)", 
+                           labels={"error": "Prediction Error (°C)", "date": "Date"}, 
+                           template="plotly_white", color_discrete_map=error_color_map_plot)
+fig_error_native.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Zero Error")
+fig_error_native.update_layout(height=600)
+fig_error_native.show()
+
+# --- SECTION 6.2 Feature Importance (Native Multi-Output) ---
+print(f"\n--- Feature Importances for Native Multi-Output Model ---")
+# This section remains commented out as native multi-output tree doesn't directly support feature_importances_
+print("NOTE: Feature importances for native multi-output trees (multi_strategy='multi_output_tree')")
+print("are not directly available via .feature_importances_ in current XGBoost versions (due to internal gain calculation limitations).")
+```
+
+## 7. Overall Performance Summary and Trends
+This section consolidates the results from all models for direct comparison.
+
+```{python, cache: true}
+import pandas as pd
+import plotly.express as px
+
+# Consolidate all results collected during model deep dives
+df_all_model_results = pd.DataFrame(all_model_comparison_results)
+print("\n--- Consolidated Model Performance Metrics ---")
+print(df_all_model_results)
+
+# --- Bar Chart Comparison (MAE) ---
+fig_mae_compare = px.bar(
+    df_all_model_results,
+    x="Horizon",
+    y="MAE",
+    color="Model",
+    barmode="group",
+    title="MAE Comparison Across Models and Forecast Horizons",
+    labels={"MAE": "Mean Absolute Error (°C)"},
+    template="plotly_white"
+)
+fig_mae_compare.update_layout(height=500)
+fig_mae_compare.show()
+
+# --- Bar Chart Comparison (RMSE) ---
+fig_rmse_compare = px.bar(
+    df_all_model_results,
+    x="Horizon",
+    y="RMSE",
+    color="Model",
+    barmode="group",
+    title="RMSE Comparison Across Models and Forecast Horizons",
+    labels={"RMSE": "Root Mean Squared Error (°C)"},
+    template="plotly_white"
+)
+fig_rmse_compare.update_layout(height=500)
+fig_rmse_compare.show()
+
+# --- Line Plot Comparison (MAE vs. Horizon) ---
+fig_mae_line = px.line(
+    df_all_model_results,
+    x="Horizon",
+    y="MAE",
+    color="Model",
+    title="MAE Trend Across Forecast Horizons for Each Model",
+    labels={"MAE": "Mean Absolute Error (°C)"},
+    template="plotly_white",
+    markers=True
+)
+fig_mae_line.update_layout(height=500)
+fig_mae_line.show()
+
+# --- Line Plot Comparison (RMSE vs. Horizon) ---
+fig_rmse_line = px.line(
+    df_all_model_results,
+    x="Horizon",
+    y="RMSE",
+    color="Model",
+    title="RMSE Trend Across Forecast Horizons for Each Model",
+    labels={"RMSE": "Root Mean Squared Error (°C)"},
+    template="plotly_white",
+    markers=True
+)
+fig_rmse_line.update_layout(height=500)
+fig_rmse_line.show()
+```
+
+## 8. Conclusion and Future Work
+Conclusion
+(Add your overall conclusions here based on the metrics and plots. Discuss which model performed best, why you think so, and the impact of different feature sets and strategies.)
+
+Future Work
+(Suggest potential next steps, such as hyperparameter tuning for the best model, exploring other advanced features, trying different model types, or implementing true out-of-fold validation.)

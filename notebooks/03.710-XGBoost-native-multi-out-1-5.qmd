@@ -1,0 +1,408 @@
+---
+title: "03.70 – XGBoost Native Multi-Output T2M Forecasts"
+format: html
+jupyter: python3
+----------------
+
+## 0. Parameters
+
+```{python}
+from pathlib import Path
+
+# ─── Editable parameters ─────────────────────────────────────────────
+city        = "Chattanooga"      # which city to model
+train_start = "2000-01-01"       # inclusive
+train_end   = "2022-12-31"       # inclusive
+test_start  = "2023-01-01"       # inclusive
+test_end    = "2024-12-31"       # inclusive
+forecast_horizon = None          # not used; we forecast exactly test range
+
+# ─── Internal paths ─────────────────────────────────────────────────
+project_root = Path().resolve().parent
+db_path      = project_root / "weather.duckdb"
+
+assert db_path.exists(), f"DuckDB not found at {db_path}"
+print(f"DB path:       {db_path}")
+print(f"City:          {city}")
+print(f"Train window:  {train_start} → {train_end}")
+print(f"Test window:   {test_start} → {test_end}")
+```
+
+
+## 1. Load & Clean Data
+
+```{python}
+import duckdb
+import pandas as pd
+
+# 1a) Query raw columns from DuckDB
+query = f"""
+SELECT
+  date,
+  t2m,
+  t2m_max,
+  t2m_min,
+  t2m_range,
+  dewpoint,
+  rh2m,
+  ws10m,
+  wd10m,
+  ps,
+  allsky_sw_dwn,
+  allsky_lw_dwn,
+  prectotcorr
+FROM weather
+WHERE location = '{city}'
+  AND date BETWEEN '{train_start}' AND '{test_end}'
+ORDER BY date
+"""
+df = duckdb.connect(str(db_path)).execute(query).fetchdf()
+
+# 1b) Convert and drop sentinel
+numeric_cols = [
+    "t2m","t2m_max","t2m_min","t2m_range","dewpoint","rh2m","ws10m",
+    "wd10m","ps","allsky_sw_dwn","allsky_lw_dwn","prectotcorr"
+]
+df["date"] = pd.to_datetime(df["date"])
+df = df[(df[numeric_cols]!= -999).all(axis=1)]
+
+print(f"After cleaning: {df.shape[0]} rows")
+df.head()
+```
+
+## 2. Feature Engineering
+
+```{python}
+import numpy as np
+
+# 2a) Date to numeric
+df["date_ordinal"] = df["date"].map(pd.Timestamp.toordinal)
+
+# 2b) Day-of-year and seasonal transform
+df["day_of_year"] = df["date"].dt.dayofyear
+df["doy_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 365)
+df["doy_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365)
+
+# --- NEW: Additional Calculable Features ---
+df['t2m_ratio_to_t2m_min'] = df['t2m'] / df['t2m_min']
+df.replace([np.inf, -np.inf], np.nan, inplace=True) 
+
+df['t2m_dewpoint_spread'] = df['t2m'] - df['dewpoint']
+df['t2m_avg_from_max_min'] = (df['t2m_max'] + df['t2m_min']) / 2
+df['ps_change_24hr'] = df['ps'].diff(periods=1)
+df['wind_u'] = df['ws10m'] * np.sin(np.radians(df['wd10m']))
+df['wind_v'] = df['ws10m'] * np.cos(np.radians(df['wd10m']))
+df['t2m_range_normalized'] = df['t2m_range'] / df['t2m']
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+
+# --- MODIFIED: Target and Features for multiple forecast horizons (1, 2, 3, 4, 5 days) ---
+df["t2m_1_day_later"] = df["t2m"].shift(-1)
+df["t2m_2_days_later"] = df["t2m"].shift(-2) # NEW TARGET
+df["t2m_3_days_later"] = df["t2m"].shift(-3)
+df["t2m_4_days_later"] = df["t2m"].shift(-4) # NEW TARGET
+df["t2m_5_days_later"] = df["t2m"].shift(-5)
+
+# Feature columns list (unchanged)
+feature_cols = [
+    "date_ordinal", "day_of_year", "doy_sin", "doy_cos",
+    "t2m", "t2m_min", "t2m_max", "t2m_range", "dewpoint", "rh2m",
+    "ws10m", "wd10m", "ps", "allsky_sw_dwn", "allsky_lw_dwn", "prectotcorr",
+    "t2m_ratio_to_t2m_min", "t2m_dewpoint_spread", "t2m_avg_from_max_min",
+    "ps_change_24hr", "wind_u", "wind_v", "t2m_range_normalized"
+]
+
+# MODIFIED: Target columns now include 1, 2, 3, 4, 5 days
+target_cols = [
+    "t2m_1_day_later",
+    "t2m_2_days_later",
+    "t2m_3_days_later",
+    "t2m_4_days_later",
+    "t2m_5_days_later"
+]
+
+# --- Handle NaNs from shifting targets and new calculations ---
+all_cols_to_check_for_nan = target_cols + [
+    "t2m_ratio_to_t2m_min", "t2m_dewpoint_spread", "t2m_avg_from_max_min",
+    "ps_change_24hr", "wind_u", "wind_v", "t2m_range_normalized"
+]
+
+original_rows = df.shape[0]
+df.dropna(subset=all_cols_to_check_for_nan, inplace=True)
+print(f"Dropped {original_rows - df.shape[0]} rows due to NaNs from shifting targets and new calculations.")
+
+print("Features:", feature_cols)
+print("Targets: ", target_cols)
+df.tail()
+```
+
+## 3. Train/Test Split
+
+```{python}
+# 3a) Boolean masks
+mask_train = (df["date"] >= train_start) & (df["date"] <= train_end)
+mask_test  = (df["date"] >= test_start)  & (df["date"] <= test_end)
+
+train_df = df[mask_train].reset_index(drop=True)
+test_df  = df[mask_test].reset_index(drop=True)
+
+print("Train rows:", train_df.shape[0])
+print("Test rows: ", test_df.shape[0])
+```
+
+## 4. Train XGBoost Model
+
+```{python}
+from xgboost import XGBRegressor
+
+# 4a) Prepare arrays for multi-output training
+iX_train = train_df[feature_cols]
+iy_train = train_df[target_cols] # iy_train DataFrame contains all 5 target columns
+
+# 4b) Instantiate & fit the native multi-output XGBoost model
+xgb_multi_output_model = XGBRegressor(
+    n_estimators=100,
+    learning_rate=0.1,
+    random_state=0,
+    tree_method="hist",
+    multi_strategy="multi_output_tree" # Enable native multi-output
+)
+
+print(f"Training Native Multi-Output Model for targets: {target_cols}")
+xgb_multi_output_model.fit(iX_train, iy_train)
+models = {"multi_output_model": xgb_multi_output_model} 
+print("Native Multi-Output Model training complete.")
+```
+
+## 5. Forecast & Evaluate
+
+```{python}
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import numpy as np
+
+df_eval = pd.DataFrame({"date": test_df["date"]})
+
+X_test = test_df[feature_cols]
+# Predicts all 5 targets at once
+y_pred_all_targets = models["multi_output_model"].predict(X_test)
+
+# Unpack predictions into separate columns in df_eval
+for i, target_col in enumerate(target_cols):
+    df_eval[f"y_true_{target_col}"] = test_df[target_col]
+    df_eval[f"y_pred_{target_col}"] = y_pred_all_targets[:, i]
+
+# Calculate metrics for each target as before
+for target_col in target_cols:
+    y_true = df_eval[f"y_true_{target_col}"]
+    y_pred = df_eval[f"y_pred_{target_col}"]
+
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    print(f"\nMetrics for {target_col}:")
+    print(f"  RMSE: {rmse:.3f}, MAE: {mae:.3f}")
+
+df_eval.head()
+```
+
+## 6.0 Plot Results (All Series)
+
+```{python}
+import plotly.express as px
+import pandas as pd
+
+# Define plotting colors (expanded for 5 horizons if desired, but 3 base colors will extend)
+base_blue_1 = "#007BFF" # Darker blue
+base_blue_2 = "#3399FF" # Slightly lighter
+base_blue_3 = "#66B2FF" # Medium blue
+base_blue_4 = "#99CCFF" # Lighter
+base_blue_5 = "#ADD8FF" # Lightest blue
+
+plot_df_list = []
+
+# Add Actual (Today's Mean Temp)
+plot_df_list.append(
+    df[["date", "t2m"]].assign(series="Actual (Today's Mean Temp)")
+    .rename(columns={"t2m": "temperature"})
+)
+
+# Process training data
+for target_col in target_cols:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    plot_df_list.append(
+        train_df[["date", target_col]].assign(
+            series=f"Train (t2m_{horizon_name})"
+        ).rename(columns={target_col: "temperature"})
+    )
+
+# Process test data (Actuals and Predictions)
+for target_col in target_cols:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    
+    # Test Actual
+    plot_df_list.append(
+        df_eval[["date", f"y_true_{target_col}"]].assign(
+            series=f"Test Actual ({horizon_name})"
+        ).rename(columns={f"y_true_{target_col}": "temperature"})
+    )
+    
+    # Test Prediction
+    plot_df_list.append(
+        df_eval[["date", f"y_pred_{target_col}"]].assign(
+            series=f"Test Pred ({horizon_name})"
+        ).rename(columns={f"y_pred_{target_col}": "temperature"})
+    )
+
+plot_df = pd.concat(plot_df_list, ignore_index=True)
+
+
+# Define color map for all series (adjusted for 5 horizons)
+color_map = {
+    "Actual (Today's Mean Temp)": "black",
+
+    # Train Data
+    "Train (t2m_1 day(s))": "#7a9cb2", # Example muted blue
+    "Train (t2m_2 day(s))": "#8bb0c4", # Muted
+    "Train (t2m_3 day(s))": "#a0b7c7", # Muted
+    "Train (t2m_4 day(s))": "#b5cdd2", # Muted
+    "Train (t2m_5 day(s))": "#c5d2db", # Muted
+
+    # Test Actuals
+    "Test Actual (1 day(s))": base_blue_1,
+    "Test Actual (2 day(s))": base_blue_2,
+    "Test Actual (3 day(s))": base_blue_3,
+    "Test Actual (4 day(s))": base_blue_4,
+    "Test Actual (5 day(s))": base_blue_5,
+
+    # Test Predictions (dashed)
+    "Test Pred (1 day(s))": base_blue_1, # Use base colors directly, let dashes differentiate
+    "Test Pred (2 day(s))": base_blue_2,
+    "Test Pred (3 day(s))": base_blue_3,
+    "Test Pred (4 day(s))": base_blue_4,
+    "Test Pred (5 day(s))": base_blue_5,
+}
+
+# Adjust shades for predictions to be slightly lighter if desired, or use dashes heavily
+color_map["Test Pred (1 day(s))"] = "#3399FF" # Slightly lighter than base_blue_1
+color_map["Test Pred (2 day(s))"] = "#66CCFF" # Lighter than base_blue_2
+color_map["Test Pred (3 day(s))"] = "#99CCFF" # Lighter than base_blue_3
+color_map["Test Pred (4 day(s))"] = "#C5E3FF" # Lighter than base_blue_4
+color_map["Test Pred (5 day(s))"] = "#E0F2FF" # Lighter than base_blue_5
+
+
+line_dash_map = {
+    "Actual (Today's Mean Temp)": "solid",
+    "Train (t2m_1 day(s))": "dot",
+    "Train (t2m_2 day(s))": "dot",
+    "Train (t2m_3 day(s))": "dot",
+    "Train (t2m_4 day(s))": "dot",
+    "Train (t2m_5 day(s))": "dot",
+    "Test Actual (1 day(s))": "solid",
+    "Test Actual (2 day(s))": "solid",
+    "Test Actual (3 day(s))": "solid",
+    "Test Actual (4 day(s))": "solid",
+    "Test Actual (5 day(s))": "solid",
+    "Test Pred (1 day(s))": "dash",
+    "Test Pred (2 day(s))": "dash",
+    "Test Pred (3 day(s))": "dash",
+    "Test Pred (4 day(s))": "dash",
+    "Test Pred (5 day(s))": "dash",
+}
+
+fig = px.line(
+    plot_df,
+    x="date",
+    y="temperature",
+    color="series",
+    title=f"XGBoost Baseline for {city} - Multi-Day Forecasts (Target: T2M)",
+    template="plotly_white",
+    color_discrete_map=color_map,
+    line_dash_map=line_dash_map
+)
+fig.update_layout(height=600, xaxis_title="Date", yaxis_title="T2M Mean Temp (°C)")
+fig.show()
+```
+
+# 6.1 plot differences
+
+```{python}
+import plotly.express as px
+import pandas as pd
+
+plot_error_df_list = []
+
+for target_col in target_cols:
+    horizon_name = target_col.replace('t2m_', '').replace('_later', ' day(s)')
+    
+    # Calculate the error: Test Actual - Test Prediction
+    error_col = f"error_{horizon_name}"
+    df_eval[error_col] = df_eval[f"y_true_{target_col}"] - df_eval[f"y_pred_{target_col}"]
+    
+    plot_error_df_list.append(
+        df_eval[["date", error_col]].assign(
+            series=f"Error ({horizon_name})"
+        ).rename(columns={error_col: "error"}) # Standardize column name to 'error'
+    )
+
+plot_error_df = pd.concat(plot_error_df_list, ignore_index=True)
+
+# Define distinct colors for the error lines (adjusted for 5 horizons)
+error_color_map = {
+    "Error (1 day(s))": "blue",
+    "Error (2 day(s))": "#4CAF50", # A new green shade
+    "Error (3 day(s))": "green",
+    "Error (4 day(s))": "#FFC107", # An amber shade
+    "Error (5 day(s))": "red",
+}
+
+fig_error = px.line(
+    plot_error_df,
+    x="date",
+    y="error",
+    color="series",
+    title=f"Forecast Error for {city} by Horizon (Test Set - Target: T2M)",
+    labels={"error": "Prediction Error (°C)", "date": "Date"}, # Customize labels
+    template="plotly_white",
+    color_discrete_map=error_color_map
+)
+
+# Add a horizontal line at y=0 to easily visualize positive vs. negative errors
+fig_error.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Zero Error")
+
+fig_error.update_layout(height=600)
+fig_error.show()
+```
+
+## 6.2 Feature Importance
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Accessing feature importance from the native multi-output model
+# With multi_strategy="multi_output_tree", .feature_importances_ returns a single array
+# representing the feature importance aggregated across all outputs.
+model_multi_output = models["multi_output_model"]
+feature_importances = model_multi_output.feature_importances_
+
+importance_df = pd.DataFrame({
+    'Feature': feature_cols,
+    'Importance': feature_importances
+})
+importance_df = importance_df.sort_values(by='Importance', ascending=False)
+
+print(f"Feature Importances for Native Multi-Output Model (Target: T2M across all horizons):")
+print(importance_df.head(10)) # Print top 10 features
+
+# Plotting the top N feature importances
+plt.figure(figsize=(12, 6))
+sns.barplot(x='Importance', y='Feature', data=importance_df.head(10), palette='viridis')
+plt.title(f'Top 10 Feature Importances for Native Multi-Output Model (Target: T2M)')
+plt.xlabel('Importance (F-score or Gain)')
+plt.ylabel('Feature')
+plt.grid(axis='x', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+```
+
+
